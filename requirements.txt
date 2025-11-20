@@ -1,0 +1,4 @@
+# National Instruments DAQmx library for PXIe-4468
+nidaqmx
+numpy
+matplotlib
