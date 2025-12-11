@@ -9,7 +9,7 @@ Front Panel Controls / Indicators
 - Ring (dropdown) — name: Frequency (Hz) — items: 60, 120, 8192, 29430 (display values are numeric).
 - Numeric control (read-only) — name: Computed Sample Rate (S/s) — shows the computed sample rate.
 - Numeric control (read-only) — name: Samples Per Cycle (N) — integer.
-- String control — name: Physical Channel (default "Dev1/ao0").
+- Ring (dropdown) — name: Physical Channel — items: Dev1/ao0, Dev1/ao1, Dev1/ao2, Dev1/ao3, Dev1/ao4, Dev1/ao5, Dev1/ao6, Dev1/ao7 (default: Dev1/ao0).
 - Numeric control — name: Device Max Sample Rate (S/s) — default 200000.
 - Numeric control — name: Amplitude (V peak) — default 1.0.
 - Boolean button — name: Start.
@@ -18,11 +18,51 @@ Front Panel Controls / Indicators
 
 Block Diagram Overview
 ----------------------
-1) Use a While Loop that runs until Stop pressed. Inside the while loop use an Event Structure configured for:
-   - Value Change on the Frequency ring (and optionally the Start button).
-   - Timeout event: used to service continuous writes if you prefer continuous refill (not mandatory).
+1) **Main While Loop and Event Structure**:
+   
+   **While Loop Configuration:**
+   - Place a While Loop on the block diagram (this will be your main execution loop).
+   - Wire the Stop button (inverted with a NOT gate) to the conditional terminal (red circle on bottom-right of loop).
+   - The loop continues running while Stop = FALSE, and exits when Stop = TRUE.
+   
+   **Event Structure Inside the While Loop:**
+   - Place an Event Structure inside the While Loop.
+   - Right-click the Event Structure border → "Edit Events" to configure event cases:
+   
+   **Event Case 1: "Frequency: Value Change"**
+   - Trigger: When user selects a new frequency from the Frequency (Hz) ring.
+   - Purpose: Recalculate sample rate, regenerate sine buffer, and restart DAQmx task with new parameters.
+   - This is where the main signal generation logic lives (see step 2 below).
+   
+   **Event Case 2: "Physical Channel: Value Change"** (optional but recommended)
+   - Trigger: When user selects a different AO channel.
+   - Purpose: Stop current task, recreate with new channel, restart generation.
+   - Can combine this with Frequency event or handle separately for clarity.
+   
+   **Event Case 3: "Start: Value Change"** (optional)
+   - Trigger: When Start button is pressed.
+   - Purpose: Manually start generation if not auto-starting on frequency change.
+   - Useful if you want explicit user control over when output begins.
+   
+   **Event Case 4: "Timeout"** (optional, use if implementing continuous buffer refill)
+   - Set timeout value (e.g., 500 ms or -1 for no timeout if not using).
+   - Purpose: Periodically write new data to the DAQmx buffer if implementing a producer-consumer pattern.
+   - **For this VI with hardware regeneration, timeout is NOT mandatory** — writing once with continuous timing is sufficient.
+   - If using timeout for status updates only, set it to 1000 ms and keep the case empty or add status indicators.
+   
+   **Event Structure Best Practices:**
+   - Use the "Filter" event node to prevent events from queuing up while processing.
+   - Include error handling in each event case.
+   - If no timeout case is needed, set Event Structure timeout to -1 (wait indefinitely).
+   
+   **Execution Flow:**
+   - Loop starts → Event Structure waits for an event
+   - User changes Frequency → "Frequency: Value Change" case executes
+   - Case completes → Loop iterates back to Event Structure
+   - Loop continues until Stop button pressed
+   - On Stop: Exit loop → Execute cleanup code outside loop (DAQmx Stop/Clear)
 
-2) On Frequency Value Change:
+2) **On Frequency Value Change Event (Main Logic):**
    - Read the selected frequency f (double).
    - Read DeviceMax (default 200000), Amplitude, Physical Channel.
    - Compute maxN = floor(DeviceMax / f).
