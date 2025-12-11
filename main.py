@@ -572,7 +572,7 @@ def main():
         print(f"\nSuccessfully connected to device: {device_name}")
         
         # Configuration parameters (easily adjustable)
-        DEVICE = "Dev1"  # Change if your device has a different name
+        DEVICE = "SV1"  # Change if your device has a different name
         AO_CHANNEL = "ao1"
         AI_CHANNEL = "ai1"
         FREQUENCY = 1000.0  # Hz - initial frequency
