@@ -12,7 +12,10 @@
 - ✅ CSV-based frequency selection (`frequencies.CSV`)
 - ✅ Automatic sample rate calculation
 - ✅ Real-time quality monitoring
-- ✅ 32 independent channels (8 per card)
+- ✅ 8 independent channels (2 per card: AO0-AO1)
+- ✅ Real-time analog input monitoring (RMS/Peak for AI0-AI1)
+- ✅ Oscilloscope display for RF amplifier testing
+- ✅ Clipping detection and signal statistics
 
 ### 2. New Architecture
 
@@ -41,6 +44,16 @@
    - Real-time status updates
    - Bulk channel operations
    - Live frequency/sample rate display
+   - Analog input monitoring (RMS/Peak)
+   - Oscilloscope launcher buttons
+
+6. **`OscilloscopeWindow`**
+   - matplotlib embedded in tkinter
+   - Real-time waveform visualization
+   - Clipping detection (±10V)
+   - Adjustable time span and Y-scale
+   - Freeze function
+   - Signal statistics display
 
 ### 3. Key Features Implemented
 
@@ -60,30 +73,48 @@
   - Set all amplitudes to same value
 - Real-time status display
 
-#### Multi-Card Output
+#### Multi-Card Output & Input
 - Simultaneous control of 4 cards
-- 8 channels per card (AO0-AO7)
+- 2 channels per card (AO0-AO1)
+- 2 analog inputs per card (AI0-AI1) mirror outputs
 - Independent amplitude per channel
 - Same frequency across all cards
 - Thread-safe parameter updates
+- Real-time RMS and Peak voltage monitoring
+- Large AI buffers (2 seconds) prevent overflow
+- Fast read rate (50 reads/second)
 
 ### 4. User Interface
 
 #### Main Window
 ```
-┌─────────────────────────────────────────────┐
-│ Generation Control                          │
-│ Frequency: [Dropdown] Sample Rate: 100kHz  │
-│ Quality: Excellent                          │
-│ [▶ Start] [⏹ Stop]                         │
+│ [▶ Start Generation] [⏹ Stop Generation]   │
 ├─────────────────────────────────────────────┤
-│ [SV1] [SV2] [SV3] [SV4]  ← Tabs           │
+│ [SV1] [SV2] [SV3] [SV4]  ← Tabs            │
+├─────────────────────────────────────────────┤
+│ SV1 Card Control                            │
+│ [Enable All] [Disable All] [Set All Amps]  │
 │                                             │
-│ Card: SV1                                   │
-│ [Enable All] [Disable All]                 │
-│ Set All Amplitudes: [____] µV [Apply]     │
+│ ☑ AO0  [1000000] µV  Status: Active        │
+│     Input RMS: 0.707V  Peak: 1.00V  📊     │
+│ ☑ AO1  [500000] µV   Status: Active        │
+│     Input RMS: 0.354V  Peak: 0.50V  📊     │
+└─────────────────────────────────────────────┘
+```
+
+#### Oscilloscope Window
+```
+┌─────────────────────────────────────────────┐
+│ Oscilloscope - SV1/AI0                      │
+├─────────────────────────────────────────────┤
+│ [Waveform Plot with matplotlib]             │
+│   ⚠ CLIPPING DETECTED (if >9.5V)           │
 │                                             │
-│ Channel | Enabled | Amplitude | Status     │
+│ RMS: 0.707V  Peak: 1.00V  Freq: 1000 Hz   │
+│                                             │
+│ Time Span: [10ms▼]  Y-Scale: [Auto▼]      │
+│ [Freeze] [Close]                            │
+└─────────────────────────────────────────────┘
 │ AO0     | [✓]     | 1000 µV   | Active    │
 │ AO1     | [ ]     | 500 µV    | Disabled  │
 │ ...                                         │
@@ -94,21 +125,36 @@
 
 ### 5. Documentation Created/Updated
 
-1. **README.md** (enhanced)
+1. **README.md** (updated)
    - Complete feature documentation
    - Setup instructions
-   - Usage guide
-   - Technical details
+   - Usage guide with oscilloscope
+   - Technical details (2 channels per card)
+   - Analog input monitoring guide
    - Troubleshooting section
 
-2. **QUICKSTART.md** (new)
+2. **QUICKSTART.md** (updated)
    - Quick command reference
-   - GUI overview
+   - GUI overview with input monitoring
    - Common workflows
+   - Oscilloscope usage guide
+   - RF amplifier testing workflow
    - Amplitude examples
    - Troubleshooting table
 
-3. **test_setup.py** (new)
+3. **ARCHITECTURE.md** (updated)
+   - System architecture with AI tasks
+   - Data flow diagrams
+   - Oscilloscope window architecture
+   - Thread safety patterns
+   - Buffering strategies
+
+4. **CHANGES.md** (this file, updated)
+   - Complete change summary
+   - Feature list with oscilloscope
+   - Migration guide
+
+5. **test_setup.py** (existing)
    - Automated setup verification
    - Tests package imports
    - Tests NI-DAQmx connection
@@ -170,12 +216,17 @@ python main.py
 - Dataclasses for configuration
 - Type hints throughout
 - Comprehensive docstrings
+- Separate AO and AI task management
+- Non-blocking oscilloscope updates
 
 ### Performance
 - Efficient waveform generation
 - Continuous regeneration mode
-- Minimal GUI updates
+- Minimal GUI updates (10 Hz for input monitoring)
 - Optimized sample rates
+- Large AI buffers (2 seconds) prevent overflow
+- Fast AI read rate (50 Hz) ensures real-time monitoring
+- Oscilloscope uses draw_idle() for non-blocking updates
 
 ## Migration from Old Version
 
@@ -187,11 +238,14 @@ python main_old.py
 ```
 
 However, the new version provides:
-- ✅ Better multi-card support
-- ✅ Easier channel configuration
-- ✅ More professional interface
+- ✅ Better multi-card support (4 cards)
+- ✅ Easier channel configuration (2 per card)
+- ✅ More professional interface (tkinter tabs)
 - ✅ CSV-based frequency management
 - ✅ Automatic sample rate optimization
+- ✅ Real-time analog input monitoring (RMS/Peak)
+- ✅ Oscilloscope for waveform visualization
+- ✅ Clipping detection for RF amplifier testing
 
 ## Next Steps
 

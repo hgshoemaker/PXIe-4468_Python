@@ -6,8 +6,9 @@ Professional Python application for controlling up to four PXIe-4468 data acquis
 
 ### Multi-Card Support
 - **4 Cards**: Control up to 4 PXIe-4468 cards simultaneously (SV1, SV2, SV3, SV4)
-- **32 Channels Total**: Each card provides 8 analog output channels (AO0-AO7)
+- **8 Channels Total**: Each card provides 2 analog output channels (AO0-AO1)
 - **Independent Control**: Each channel can be individually enabled/disabled and configured
+- **Mirrored Inputs**: AI0-AI1 monitor the AO0-AO1 outputs for RF amplifier response
 
 ### Frequency Management
 - **CSV-Based Frequencies**: Load available frequencies from `frequencies.CSV`
@@ -21,12 +22,27 @@ Professional Python application for controlling up to four PXIe-4468 data acquis
 - **Bulk Operations**: Set all channels on a card to the same amplitude
 - **Real-Time Display**: Status shows current amplitude in µV or mV
 
+### Real-Time Input Monitoring
+- **RMS Voltage**: Continuous RMS measurement for each analog input
+- **Peak Voltage**: Real-time peak voltage detection
+- **Live Updates**: Measurements update 10 times per second
+- **RF Amplifier Testing**: Monitor amplifier response to stimulus signals
+
+### Oscilloscope Display
+- **📊 Scope Button**: Open oscilloscope window for any channel
+- **Live Waveforms**: Real-time visualization of analog input signals
+- **Clipping Detection**: Automatic warnings when signal approaches ±10V limits
+- **Adjustable Controls**: Configurable Y-scale (Auto, ±1V to ±10V) and time span (10ms to 200ms)
+- **Freeze Function**: Pause display to examine waveform details
+- **Signal Statistics**: RMS, peak, and frequency information
+
 ### Professional GUI
 - **Tabbed Interface**: Separate tab for each card
 - **Live Status**: Real-time status for each channel (Idle/Ready/Active/Disabled)
 - **Easy Control**: Enable/disable channels with checkboxes
 - **Frequency Selector**: Dropdown menu with all available frequencies from CSV
 - **Start/Stop**: Simple buttons to control signal generation
+- **Inline Measurements**: RMS and peak values displayed next to each channel
 
 ## Setup
 
@@ -76,7 +92,7 @@ python main.py
 
 2. **Configure Channels**
    - Click on a card tab (SV1, SV2, SV3, SV4)
-   - Check/uncheck boxes to enable/disable channels
+   - Check/uncheck boxes to enable/disable channels (AO0, AO1)
    - Enter amplitude in microvolts (µV) for each channel
    - Use "Enable All" / "Disable All" for quick setup
    - Use "Set All Amplitudes" to apply same amplitude to all channels
@@ -85,8 +101,23 @@ python main.py
    - Click "▶ Start Generation"
    - All enabled channels will output sine waves at the selected frequency
    - Status bar shows active generation details
+   - RMS and Peak columns show live input measurements
 
-4. **Stop Generation**
+4. **Monitor RF Amplifier Response**
+   - Watch the Input RMS and Peak columns update in real-time
+   - Values shown are from AI0-AI1 monitoring your RF amplifier outputs
+   - Blue text = RMS voltage, Green text = Peak voltage
+
+5. **View Waveforms (Oscilloscope)**
+   - Click "📊 Scope" button next to any channel
+   - View real-time waveform from the analog input
+   - Check for clipping warnings (red alerts)
+   - Adjust time span (10ms to 200ms)
+   - Change Y-scale (Auto or fixed ranges)
+   - Click "Freeze" to pause and examine the waveform
+   - Open multiple oscilloscope windows simultaneously
+
+6. **Stop Generation**
    - Click "⏹ Stop Generation"
    - All outputs stop immediately
 
@@ -118,11 +149,14 @@ The application automatically calculates the optimal sample rate:
 - **Conversion**: Automatically converts µV to V for DAQmx
 - **Precision**: Floating-point precision maintained
 
-### Multi-Channel Output
+### Multi-Channel Output & Input
 - All channels on a card share the same frequency and sample rate
 - Each channel has independent amplitude
 - Waveforms are generated and written as interleaved multi-channel data
 - Continuous regeneration mode for seamless output
+- Analog inputs (AI0-AI1) monitor corresponding outputs (AO0-AO1)
+- Large input buffers (2 seconds) prevent data loss
+- Fast acquisition rate (50 reads/second) ensures real-time monitoring
 
 ## Requirements
 
@@ -136,6 +170,8 @@ The application automatically calculates the optimal sample rate:
 ```
 nidaqmx      # NI-DAQmx Python API
 numpy        # Numerical computing
+matplotlib   # Oscilloscope display
+tkinter      # GUI (included with Python)
 ```
 
 ## Troubleshooting
@@ -160,6 +196,22 @@ numpy        # Numerical computing
 - Configure device names in NI MAX
 - Rename devices to SV1, SV2, SV3, SV4
 - Restart the application
+
+### Input Measurements Show Zero
+- Ensure analog inputs (AI0, AI1) are connected
+- Check that RF amplifier outputs are connected to AI channels
+- Verify generation is running (not just started)
+
+### Oscilloscope Shows No Waveform
+- Make sure generation is active before opening oscilloscope
+- Check that the channel is enabled
+- Verify analog input connections
+- Wait a moment for buffer to fill with data
+
+### "Application is not able to keep up" Error
+- This has been fixed with larger buffers and faster reads
+- If still occurring, reduce the number of enabled channels
+- Close unnecessary oscilloscope windows
 
 ## Project Structure
 

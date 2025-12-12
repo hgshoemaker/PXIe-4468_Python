@@ -36,11 +36,14 @@ python main.py
 ### Card Tabs (SV1, SV2, SV3, SV4)
 Each tab has:
 - **Enable All / Disable All**: Quick channel control
-- **Set All Amplitudes**: Apply same amplitude to all 8 channels
-- **8 Channel Rows** (AO0-AO7):
+- **Set All Amplitudes**: Apply same amplitude to both channels
+- **2 Channel Rows** (AO0-AO1):
   - Checkbox: Enable/disable channel
   - Amplitude field: Enter value in µV
   - Status: Shows current state
+  - Input RMS: Real-time RMS measurement (blue)
+  - Input Peak: Real-time peak voltage (green)
+  - Scope Button: Open oscilloscope window
 
 ## Common Workflows
 
@@ -64,6 +67,26 @@ Each tab has:
 3. Enable only AO0
 4. Set amplitude to 1000000 µV (1 mV)
 5. Click "Start Generation"
+
+### 4. Monitor RF Amplifier Response
+1. Connect RF amplifier input to AO channel
+2. Connect RF amplifier output to corresponding AI channel
+   - AO0 → amplifier → AI0
+   - AO1 → amplifier → AI1
+3. Start generation
+4. Watch Input RMS and Peak columns for live measurements
+5. Click "📊 Scope" to view waveform
+
+### 5. Use Oscilloscope to Check for Clipping
+1. Start generation on any channel
+2. Click "📊 Scope" button next to channel
+3. Oscilloscope window opens showing real-time waveform
+4. Check for red "⚠ CLIPPING" warnings
+5. Adjust time span (10ms to 200ms)
+6. Change Y-scale (Auto, ±1V, ±2V, ±5V, ±10V)
+7. Click "Freeze" to pause and examine details
+8. View signal statistics (RMS, Peak, Frequency)
+9. Close window or keep open while testing
 
 ## Amplitude Examples
 
