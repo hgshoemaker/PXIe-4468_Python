@@ -322,9 +322,9 @@ class MultiCardGenerator:
                     traceback.print_exc()
                     continue
             
-            # Create analog input tasks to monitor outputs
+            # Create analog input tasks to monitor outputs (optional - don't fail if this doesn't work)
             if tasks_created:
-                print("\n--- Creating Analog Input Monitoring ---")
+                print("\n--- Creating Analog Input Monitoring (Optional) ---")
                 for card_name, channel_list in cards.items():
                     try:
                         ai_task = nidaqmx.Task()
@@ -340,12 +340,17 @@ class MultiCardGenerator:
                                 max_val=10.0
                             )
                         
-                        # Configure timing for continuous acquisition
+                        # Configure timing for continuous acquisition with large buffer
+                        # Buffer size should be at least 2 seconds of data
+                        buffer_size = int(srate * 2)  # 2 seconds of buffer
                         ai_task.timing.cfg_samp_clk_timing(
                             rate=srate,
                             sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
-                            samps_per_chan=1000  # Read 1000 samples at a time
+                            samps_per_chan=buffer_size
                         )
+                        
+                        # Configure input buffer to be even larger
+                        ai_task.in_stream.input_buf_size = buffer_size * 2
                         
                         ai_task.start()
                         self.ai_tasks[card_name] = ai_task
@@ -353,6 +358,8 @@ class MultiCardGenerator:
                         
                     except Exception as e:
                         print(f"  ⚠ Could not create AI task for {card_name}: {e}")
+                        print(f"     Continuing without input monitoring for this card...")
+                        # Continue - AI monitoring is optional
                         # Continue without AI monitoring
             
             if tasks_created:
@@ -361,21 +368,41 @@ class MultiCardGenerator:
             
             # Keep thread alive and update input measurements
             while not self.stop_event.is_set():
-                # Read and process input data
-                for card_name, ai_task in list(self.ai_tasks.items()):
-                    try:
-                        # Read available samples
-                        data = ai_task.read(number_of_samples_per_channel=1000)
-                        
-                        # Process each channel
-                        if isinstance(data[0], list):
-                            # Multiple channels
-                            for ch_idx, channel_data in enumerate(data):
-                                channel_data = np.array(channel_data)
+                try:
+                    # Read and process input data
+                    for card_name, ai_task in list(self.ai_tasks.items()):
+                        try:
+                            # Read more samples to prevent buffer overflow
+                            # Read at least 0.1 seconds worth of data
+                            samples_to_read = max(int(srate * 0.1), 5000)
+                            data = ai_task.read(number_of_samples_per_channel=samples_to_read, timeout=2.0)
+                            
+                            # Process each channel
+                            if isinstance(data[0], list):
+                                # Multiple channels
+                                for ch_idx, channel_data in enumerate(data):
+                                    channel_data = np.array(channel_data)
+                                    rms = np.sqrt(np.mean(channel_data**2))
+                                    peak = np.max(np.abs(channel_data))
+                                    
+                                    key = f"{card_name}_{ch_idx}"
+                                    with self.lock:
+                                        self.input_data[key] = {"rms": rms, "peak": peak}
+                                        # Store waveform for oscilloscope
+                                        if key not in self.scope_data:
+                                            self.scope_data[key] = channel_data[:self.scope_buffer_size]
+                                        else:
+                                            # Roll buffer and append new data
+                                            current = self.scope_data[key]
+                                            new_data = np.concatenate([current, channel_data])
+                                            self.scope_data[key] = new_data[-self.scope_buffer_size:]
+                            else:
+                                # Single channel
+                                channel_data = np.array(data)
                                 rms = np.sqrt(np.mean(channel_data**2))
                                 peak = np.max(np.abs(channel_data))
                                 
-                                key = f"{card_name}_{ch_idx}"
+                                key = f"{card_name}_0"
                                 with self.lock:
                                     self.input_data[key] = {"rms": rms, "peak": peak}
                                     # Store waveform for oscilloscope
@@ -386,27 +413,36 @@ class MultiCardGenerator:
                                         current = self.scope_data[key]
                                         new_data = np.concatenate([current, channel_data])
                                         self.scope_data[key] = new_data[-self.scope_buffer_size:]
-                        else:
-                            # Single channel
-                            channel_data = np.array(data)
-                            rms = np.sqrt(np.mean(channel_data**2))
-                            peak = np.max(np.abs(channel_data))
-                            
-                            key = f"{card_name}_0"
-                            with self.lock:
-                                self.input_data[key] = {"rms": rms, "peak": peak}
-                                # Store waveform for oscilloscope
-                                if key not in self.scope_data:
-                                    self.scope_data[key] = channel_data[:self.scope_buffer_size]
+                        except Exception as e:
+                            # Log AI read errors but continue
+                            if "timeout" not in str(e).lower():
+                                print(f"  AI read error for {card_name}: {e}")
+                    
+                    # Verify AO tasks are still running (every 20 iterations = ~1 second)
+                    if not hasattr(self, '_check_counter'):
+                        self._check_counter = 0
+                    self._check_counter += 1
+                    
+                    if self._check_counter >= 20:
+                        self._check_counter = 0
+                        for card_name, ao_task in list(self.ao_tasks.items()):
+                            try:
+                                # Check if task is still running
+                                if not ao_task.is_task_done():
+                                    pass  # Task is running fine
                                 else:
-                                    # Roll buffer and append new data
-                                    current = self.scope_data[key]
-                                    new_data = np.concatenate([current, channel_data])
-                                    self.scope_data[key] = new_data[-self.scope_buffer_size:]
-                    except:
-                        pass  # Continue if no data available
-                
-                time.sleep(0.05)
+                                    print(f"  WARNING: AO task for {card_name} has stopped!")
+                            except:
+                                pass
+                    
+                    # Sleep less to read more frequently and prevent buffer overflow
+                    time.sleep(0.02)  # Read every 20ms instead of 50ms
+                    
+                except Exception as e:
+                    print(f"  Error in monitoring loop: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    time.sleep(0.1)
             
             print("\n*** STOPPING OUTPUT ***")
         
@@ -439,13 +475,15 @@ class MultiCardGenerator:
         """Get RMS and peak measurements for a specific input channel."""
         key = f"{card_name}_{channel_number}"
         with self.lock:
-            return self.input_data.get(key, {"rms": 0.0, "peak": 0.0})
+            return self.input_data.get(key, {"rms": 0.0, "peak": 0.0}).copy()
     
     def get_scope_data(self, card_name: str, channel_number: int) -> np.ndarray:
-        """Get oscilloscope waveform data for a specific input channel."""
+        """Get oscilloscope waveform data for a specific input channel. Returns a copy."""
         key = f"{card_name}_{channel_number}"
         with self.lock:
-            return self.scope_data.get(key, np.array([]))
+            data = self.scope_data.get(key, np.array([]))
+            # Return a copy so we don't hold the lock during plotting
+            return data.copy() if len(data) > 0 else np.array([])
 
 
 class OscilloscopeWindow:
@@ -526,60 +564,66 @@ class OscilloscopeWindow:
         if not self.is_running:
             return
         
-        if not self.frozen:
-            # Get waveform data
-            data = self.generator.get_scope_data(self.card_name, self.channel_number)
-            
-            if len(data) > 0:
-                # Parse time span
-                timespan_str = self.timespan_var.get()
-                timespan_ms = float(timespan_str.replace('ms', ''))
+        try:
+            if not self.frozen:
+                # Get waveform data (non-blocking)
+                data = self.generator.get_scope_data(self.card_name, self.channel_number)
                 
-                # Calculate how many samples to show
-                sample_rate = self.generator.sample_rate
-                samples_to_show = int((timespan_ms / 1000.0) * sample_rate)
-                samples_to_show = min(samples_to_show, len(data))
-                
-                # Get last N samples
-                display_data = data[-samples_to_show:]
-                
-                # Create time axis in milliseconds
-                time_ms = np.arange(len(display_data)) / sample_rate * 1000
-                
-                # Update plot
-                self.line.set_data(time_ms, display_data)
-                self.ax.set_xlim(0, timespan_ms)
-                
-                # Update Y scale
-                yscale = self.yscale_var.get()
-                if yscale == "Auto":
-                    margin = max(np.max(np.abs(display_data)) * 0.1, 0.1)
-                    self.ax.set_ylim(np.min(display_data) - margin, np.max(display_data) + margin)
-                else:
-                    limit = float(yscale.replace('±', '').replace('V', ''))
-                    self.ax.set_ylim(-limit, limit)
-                
-                # Check for clipping (near ±10V)
-                max_val = np.max(np.abs(display_data))
-                if max_val > 9.5:
-                    self.clip_text.set_text('⚠ CLIPPING DETECTED!')
-                elif max_val > 9.0:
-                    self.clip_text.set_text('⚠ Near Clipping')
-                else:
-                    self.clip_text.set_text('')
-                
-                # Update stats
-                rms = np.sqrt(np.mean(display_data**2))
-                peak = np.max(np.abs(display_data))
-                freq_est = self.generator.frequency
-                stats = f'RMS: {rms:.4f} V\nPeak: {peak:.4f} V\nFreq: {freq_est:.1f} Hz'
-                self.stats_text.set_text(stats)
-                
-                self.canvas.draw()
+                if len(data) > 10:  # Ensure we have enough data
+                    # Parse time span
+                    timespan_str = self.timespan_var.get()
+                    timespan_ms = float(timespan_str.replace('ms', ''))
+                    
+                    # Calculate how many samples to show
+                    sample_rate = self.generator.sample_rate
+                    samples_to_show = int((timespan_ms / 1000.0) * sample_rate)
+                    samples_to_show = min(samples_to_show, len(data))
+                    
+                    if samples_to_show > 0:
+                        # Get last N samples
+                        display_data = data[-samples_to_show:]
+                        
+                        # Create time axis in milliseconds
+                        time_ms = np.arange(len(display_data)) / sample_rate * 1000
+                        
+                        # Update plot
+                        self.line.set_data(time_ms, display_data)
+                        self.ax.set_xlim(0, timespan_ms)
+                        
+                        # Update Y scale
+                        yscale = self.yscale_var.get()
+                        if yscale == "Auto":
+                            margin = max(np.max(np.abs(display_data)) * 0.1, 0.1)
+                            self.ax.set_ylim(np.min(display_data) - margin, np.max(display_data) + margin)
+                        else:
+                            limit = float(yscale.replace('±', '').replace('V', ''))
+                            self.ax.set_ylim(-limit, limit)
+                        
+                        # Check for clipping (near ±10V)
+                        max_val = np.max(np.abs(display_data))
+                        if max_val > 9.5:
+                            self.clip_text.set_text('⚠ CLIPPING DETECTED!')
+                        elif max_val > 9.0:
+                            self.clip_text.set_text('⚠ Near Clipping')
+                        else:
+                            self.clip_text.set_text('')
+                        
+                        # Update stats
+                        rms = np.sqrt(np.mean(display_data**2))
+                        peak = np.max(np.abs(display_data))
+                        freq_est = self.generator.frequency
+                        stats = f'RMS: {rms:.4f} V\nPeak: {peak:.4f} V\nFreq: {freq_est:.1f} Hz'
+                        self.stats_text.set_text(stats)
+                        
+                        # Use draw_idle() instead of draw() - non-blocking
+                        self.canvas.draw_idle()
+        except Exception as e:
+            # Don't let plotting errors stop the oscilloscope
+            print(f"Oscilloscope update error: {e}")
         
         # Schedule next update
         if self.is_running:
-            self.window.after(50, self.update_plot)  # Update at 20 Hz
+            self.window.after(100, self.update_plot)  # Update at 10 Hz (less aggressive)
 
 
 class PXIeControlGUI:
@@ -787,9 +831,16 @@ class PXIeControlGUI:
                               "Please start generation first to view waveforms.")
             return
         
-        # Create oscilloscope window
-        OscilloscopeWindow(self.root, self.generator, 
-                          channel.card_name, channel.channel_number)
+        try:
+            # Create oscilloscope window (non-blocking)
+            print(f"Opening oscilloscope for {channel.card_name}/AI{channel.channel_number}...")
+            OscilloscopeWindow(self.root, self.generator, 
+                              channel.card_name, channel.channel_number)
+            print("Oscilloscope window opened successfully")
+        except Exception as e:
+            print(f"Error opening oscilloscope: {e}")
+            messagebox.showerror("Oscilloscope Error", 
+                               f"Failed to open oscilloscope:\n{e}")
     
     def on_frequency_changed(self, event=None):
         """Handle frequency selection change."""
