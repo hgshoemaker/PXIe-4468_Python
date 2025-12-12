@@ -1,27 +1,642 @@
 """
-Main Python application entry point for PXIe-4468 data acquisition.
+Multi-Card PXIe-4468 Sine Wave Generator
+Supports 4 cards (SV1-SV4) with per-channel amplitude control in microvolts.
 """
 
 import nidaqmx
 import nidaqmx.system
 import numpy as np
 import time
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from matplotlib.widgets import Slider, Button
+import csv
+import tkinter as tk
+from tkinter import ttk, messagebox
 from threading import Thread, Event, Lock
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+
+@dataclass
+class FrequencyOption:
+    """Represents a frequency option from the CSV file."""
+    frequency: float
+    name: str
+    available: bool = False
+    enabled: bool = False
+
+
+@dataclass
+class ChannelConfig:
+    """Configuration for a single output channel."""
+    card_name: str
+    channel_number: int  # 0-7 for PXIe-4468
+    amplitude_uv: float = 1000.0  # microvolts
+    enabled: bool = True
+
+
+class FrequencyManager:
+    """Manages loading and selection of frequencies from CSV."""
+    
+    def __init__(self, csv_path: str = "frequencies.CSV"):
+        self.csv_path = csv_path
+        self.frequencies: List[FrequencyOption] = []
+        self.load_frequencies()
+    
+    def load_frequencies(self):
+        """Load frequencies from CSV file."""
+        try:
+            with open(self.csv_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        freq = float(row['Frequency'])
+                        name = row.get('Name', f"{freq} Hz")
+                        available = row.get('Available', '').strip().upper() == 'X'
+                        enabled = row.get('Enabled', '').strip().upper() == 'X'
+                        
+                        self.frequencies.append(FrequencyOption(
+                            frequency=freq,
+                            name=name,
+                            available=available,
+                            enabled=enabled
+                        ))
+                    except (ValueError, KeyError):
+                        continue
+        except Exception as e:
+            print(f"Error loading frequencies from {self.csv_path}: {e}")
+            # Fallback to default frequencies
+            self.frequencies = [
+                FrequencyOption(50, "50Hz", True, True),
+                FrequencyOption(60, "60Hz", True, True),
+                FrequencyOption(100, "100Hz", True, True),
+                FrequencyOption(1000, "1kHz", True, True),
+                FrequencyOption(10000, "10kHz", True, True),
+            ]
+    
+    def get_available_frequencies(self) -> List[FrequencyOption]:
+        """Get list of available frequencies."""
+        return [f for f in self.frequencies if f.available or f.enabled]
+    
+    def calculate_sample_rate(self, frequency: float) -> int:
+        """
+        Calculate optimal sample rate for a given frequency.
+        Ensures at least 100 samples per cycle, rounds to nice values.
+        """
+        # Aim for at least 100 samples per cycle for good quality
+        min_samples_per_cycle = 100
+        base_rate = frequency * min_samples_per_cycle
+        
+        # Round to common sample rates
+        common_rates = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 
+                       200000, 500000, 1000000, 2000000]
+        
+        for rate in common_rates:
+            if rate >= base_rate:
+                return rate
+        
+        # If frequency is very high, use maximum
+        return 2000000  # 2 MS/s max for PXIe-4468
+
+
+class MultiCardGenerator:
+    """Manages sine wave generation across multiple PXIe-4468 cards."""
+    
+    CHANNELS_PER_CARD = 2  # PXIe-4468 has 2 analog outputs: ao0, ao1
+    CARD_NAMES = ["SV1", "SV2", "SV3", "SV4"]
+    
+    def __init__(self):
+        self.tasks: Dict[str, nidaqmx.Task] = {}
+        self.lock = Lock()
+        self.running = False
+        self.stop_event = Event()
+        
+        # Current configuration
+        self.frequency = 1000.0  # Hz
+        self.sample_rate = 100000  # Hz
+        self.channels: List[ChannelConfig] = []
+        
+        # Initialize all channels for all cards (disabled by default)
+        for card_name in self.CARD_NAMES:
+            for ch in range(self.CHANNELS_PER_CARD):
+                self.channels.append(ChannelConfig(
+                    card_name=card_name,
+                    channel_number=ch,
+                    amplitude_uv=1000.0,
+                    enabled=False
+                ))
+        
+        self.output_thread = None
+    
+    def get_channel(self, card_name: str, channel_number: int) -> Optional[ChannelConfig]:
+        """Get configuration for a specific channel."""
+        for ch in self.channels:
+            if ch.card_name == card_name and ch.channel_number == channel_number:
+                return ch
+        return None
+    
+    def set_frequency(self, frequency: float, sample_rate: int):
+        """Set the output frequency and sample rate for all channels."""
+        with self.lock:
+            self.frequency = frequency
+            self.sample_rate = sample_rate
+    
+    def set_channel_amplitude(self, card_name: str, channel_number: int, amplitude_uv: float):
+        """Set amplitude for a specific channel in microvolts."""
+        channel = self.get_channel(card_name, channel_number)
+        if channel:
+            with self.lock:
+                channel.amplitude_uv = amplitude_uv
+    
+    def set_channel_enabled(self, card_name: str, channel_number: int, enabled: bool):
+        """Enable or disable a specific channel."""
+        channel = self.get_channel(card_name, channel_number)
+        if channel:
+            with self.lock:
+                channel.enabled = enabled
+    
+    def generate_sinewave(self, frequency: float, amplitude_v: float, sample_rate: int) -> np.ndarray:
+        """Generate one period of a sine wave."""
+        period = 1.0 / frequency
+        num_samples = int(sample_rate * period)
+        # Ensure at least 2 samples
+        if num_samples < 2:
+            num_samples = 2
+        t = np.linspace(0, period, num_samples, endpoint=False)
+        return amplitude_v * np.sin(2 * np.pi * frequency * t)
+    
+    def start_generation(self) -> str:
+        """Start continuous sine wave generation. Returns status message."""
+        if self.running:
+            return "Generator already running"
+        
+        # Check if any channels are enabled
+        enabled_channels = [ch for ch in self.channels if ch.enabled]
+        if not enabled_channels:
+            return "No channels enabled. Please enable at least one channel."
+        
+        self.stop_event.clear()
+        self.running = True
+        self.output_thread = Thread(target=self._output_worker, daemon=True)
+        self.output_thread.start()
+        
+        return f"Started generation on {len(enabled_channels)} channel(s)"
+    
+    def stop_generation(self):
+        """Stop all sine wave generation."""
+        if not self.running:
+            return
+        
+        self.stop_event.set()
+        self.running = False
+        
+        # Wait for thread to finish
+        if self.output_thread:
+            self.output_thread.join(timeout=2.0)
+        
+        # Close all tasks
+        for task_name, task in list(self.tasks.items()):
+            try:
+                task.stop()
+                task.close()
+            except:
+                pass
+        self.tasks.clear()
+    
+    def _output_worker(self):
+        """Background thread that manages continuous output."""
+        try:
+            while not self.stop_event.is_set():
+                with self.lock:
+                    freq = self.frequency
+                    srate = self.sample_rate
+                    # Create copy of enabled channels
+                    enabled_chs = [(ch.card_name, ch.channel_number, ch.amplitude_uv) 
+                                  for ch in self.channels if ch.enabled]
+                
+                # Group channels by card
+                cards = {}
+                for card_name, ch_num, amp_uv in enabled_chs:
+                    if card_name not in cards:
+                        cards[card_name] = []
+                    cards[card_name].append((ch_num, amp_uv))
+                
+                # Update tasks for each card
+                for card_name, channel_list in cards.items():
+                    task_name = card_name
+                    
+                    # Create task if it doesn't exist
+                    if task_name not in self.tasks:
+                        try:
+                            task = nidaqmx.Task()
+                            
+                            # Add all channels for this card
+                            for ch_num, _ in channel_list:
+                                task.ao_channels.add_ao_voltage_chan(
+                                    f"{card_name}/ao{ch_num}",
+                                    min_val=-10.0,
+                                    max_val=10.0
+                                )
+                            
+                            # Configure timing
+                            period = 1.0 / freq
+                            samples = self.generate_sinewave(freq, 1.0, srate)  # 1V reference
+                            
+                            task.timing.cfg_samp_clk_timing(
+                                rate=srate,
+                                sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
+                                samps_per_chan=len(samples)
+                            )
+                            task.out_stream.regen_mode = nidaqmx.constants.RegenerationMode.ALLOW_REGENERATION
+                            
+                            # Generate waveforms for each channel with individual amplitudes
+                            waveforms = []
+                            for ch_num, amp_uv in channel_list:
+                                amp_v = amp_uv / 1e6  # Convert microvolts to volts
+                                waveform = self.generate_sinewave(freq, amp_v, srate)
+                                waveforms.append(waveform)
+                            
+                            # Write interleaved data
+                            task.write(waveforms, auto_start=False)
+                            task.start()
+                            
+                            self.tasks[task_name] = task
+                            
+                        except Exception as e:
+                            print(f"Error creating task for {card_name}: {e}")
+                            continue
+                
+                # Sleep for a bit before checking for updates
+                time.sleep(0.1)
+        
+        except Exception as e:
+            print(f"Output worker error: {e}")
+        finally:
+            # Clean up
+            for task in list(self.tasks.values()):
+                try:
+                    task.stop()
+                    task.close()
+                except:
+                    pass
+            self.tasks.clear()
+
+
+class PXIeControlGUI:
+    """Professional GUI for controlling multiple PXIe-4468 cards."""
+    
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("PXIe-4468 Multi-Card Sine Generator")
+        self.root.geometry("1000x800")
+        
+        # Initialize managers
+        self.freq_manager = FrequencyManager()
+        self.generator = MultiCardGenerator()
+        
+        # Current state
+        self.current_frequency = 1000.0
+        self.current_sample_rate = 100000
+        self.is_generating = False
+        
+        # Build UI
+        self.setup_ui()
+        
+        # Load initial frequency
+        self.update_frequency_selection()
+    
+    def setup_ui(self):
+        """Create the user interface."""
+        # Top control panel
+        control_frame = ttk.LabelFrame(self.root, text="Generation Control", padding=10)
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Frequency selection
+        ttk.Label(control_frame, text="Frequency:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        
+        self.freq_var = tk.StringVar()
+        self.freq_combo = ttk.Combobox(control_frame, textvariable=self.freq_var, 
+                                       width=20, state='readonly')
+        
+        available_freqs = self.freq_manager.get_available_frequencies()
+        freq_options = [f"{f.frequency} Hz - {f.name}" for f in available_freqs]
+        self.freq_combo['values'] = freq_options
+        if freq_options:
+            self.freq_combo.current(0)
+        self.freq_combo.grid(row=0, column=1, padx=5)
+        self.freq_combo.bind('<<ComboboxSelected>>', self.on_frequency_changed)
+        
+        # Sample rate display
+        ttk.Label(control_frame, text="Sample Rate:").grid(row=0, column=2, sticky=tk.W, padx=5)
+        self.srate_label = ttk.Label(control_frame, text="100000 Hz", font=('Arial', 10, 'bold'))
+        self.srate_label.grid(row=0, column=3, sticky=tk.W, padx=5)
+        
+        # Quality indicator
+        ttk.Label(control_frame, text="Quality:").grid(row=0, column=4, sticky=tk.W, padx=5)
+        self.quality_label = ttk.Label(control_frame, text="Good", 
+                                       font=('Arial', 10, 'bold'), foreground='green')
+        self.quality_label.grid(row=0, column=5, sticky=tk.W, padx=5)
+        
+        # Start/Stop buttons
+        button_frame = ttk.Frame(control_frame)
+        button_frame.grid(row=1, column=0, columnspan=6, pady=10)
+        
+        self.start_btn = ttk.Button(button_frame, text="▶ Start Generation", 
+                                    command=self.start_generation, width=20)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(button_frame, text="⏹ Stop Generation", 
+                                   command=self.stop_generation, state=tk.DISABLED, width=20)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Status bar
+        self.status_var = tk.StringVar(value="Ready")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Create notebook for cards
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Create tab for each card
+        self.card_frames = {}
+        self.channel_widgets = {}  # Store widgets for each channel
+        
+        for card_name in MultiCardGenerator.CARD_NAMES:
+            tab = ttk.Frame(notebook)
+            notebook.add(tab, text=f"Card {card_name}")
+            
+            self.card_frames[card_name] = tab
+            self.create_card_panel(tab, card_name)
+    
+    def create_card_panel(self, parent: ttk.Frame, card_name: str):
+        """Create control panel for one card."""
+        # Header with card controls
+        header = ttk.Frame(parent)
+        header.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(header, text=f"Card: {card_name}", 
+                 font=('Arial', 12, 'bold')).pack(side=tk.LEFT, padx=5)
+        
+        # Enable all / Disable all buttons
+        ttk.Button(header, text="Enable All", 
+                  command=lambda: self.set_all_channels(card_name, True)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(header, text="Disable All", 
+                  command=lambda: self.set_all_channels(card_name, False)).pack(side=tk.LEFT, padx=5)
+        
+        # Set all amplitudes
+        ttk.Label(header, text="Set All Amplitudes:").pack(side=tk.LEFT, padx=5)
+        amp_entry = ttk.Entry(header, width=10)
+        amp_entry.pack(side=tk.LEFT, padx=2)
+        ttk.Label(header, text="µV").pack(side=tk.LEFT)
+        ttk.Button(header, text="Apply", 
+                  command=lambda: self.set_all_amplitudes(card_name, amp_entry)).pack(side=tk.LEFT, padx=5)
+        
+        # Scrollable channel list
+        canvas = tk.Canvas(parent)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Channel headers
+        headers = ttk.Frame(scrollable_frame)
+        headers.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(headers, text="Channel", width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Enabled", width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Amplitude (µV)", width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Status", width=20).pack(side=tk.LEFT, padx=5)
+        
+        # Create widgets for each channel
+        for ch_num in range(MultiCardGenerator.CHANNELS_PER_CARD):
+            channel = self.generator.get_channel(card_name, ch_num)
+            if channel:
+                self.create_channel_row(scrollable_frame, channel)
+        
+        canvas.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        scrollbar.pack(side="right", fill="y")
+    
+    def create_channel_row(self, parent: ttk.Frame, channel: ChannelConfig):
+        """Create control row for a single channel."""
+        frame = ttk.Frame(parent, relief=tk.RIDGE, borderwidth=1)
+        frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        key = f"{channel.card_name}_ch{channel.channel_number}"
+        
+        # Channel label
+        ttk.Label(frame, text=f"AO{channel.channel_number}", 
+                 width=10).pack(side=tk.LEFT, padx=5)
+        
+        # Enable checkbox
+        enabled_var = tk.BooleanVar(value=channel.enabled)
+        enabled_check = ttk.Checkbutton(frame, variable=enabled_var,
+                                       command=lambda: self.on_channel_enabled_changed(channel, enabled_var))
+        enabled_check.pack(side=tk.LEFT, padx=5)
+        
+        # Amplitude entry
+        amp_var = tk.StringVar(value=str(channel.amplitude_uv))
+        amp_entry = ttk.Entry(frame, textvariable=amp_var, width=15)
+        amp_entry.pack(side=tk.LEFT, padx=5)
+        amp_entry.bind('<Return>', lambda e: self.on_amplitude_changed(channel, amp_var))
+        amp_entry.bind('<FocusOut>', lambda e: self.on_amplitude_changed(channel, amp_var))
+        
+        # Status label
+        status_label = ttk.Label(frame, text="Idle", width=20, foreground='gray')
+        status_label.pack(side=tk.LEFT, padx=5)
+        
+        # Store widgets for later access
+        self.channel_widgets[key] = {
+            'enabled_var': enabled_var,
+            'amp_var': amp_var,
+            'status_label': status_label
+        }
+    
+    def on_frequency_changed(self, event=None):
+        """Handle frequency selection change."""
+        self.update_frequency_selection()
+    
+    def update_frequency_selection(self):
+        """Update frequency and sample rate based on selection."""
+        try:
+            selected = self.freq_var.get()
+            if not selected:
+                return
+            
+            # Parse frequency from selection
+            freq_str = selected.split(' ')[0]
+            frequency = float(freq_str)
+            
+            # Calculate optimal sample rate
+            sample_rate = self.freq_manager.calculate_sample_rate(frequency)
+            
+            self.current_frequency = frequency
+            self.current_sample_rate = sample_rate
+            
+            # Update display
+            self.srate_label.config(text=f"{sample_rate:,} Hz")
+            
+            # Update quality indicator
+            samples_per_cycle = sample_rate / frequency
+            if samples_per_cycle >= 100:
+                self.quality_label.config(text="Excellent", foreground='darkgreen')
+            elif samples_per_cycle >= 50:
+                self.quality_label.config(text="Good", foreground='green')
+            elif samples_per_cycle >= 20:
+                self.quality_label.config(text="Fair", foreground='orange')
+            else:
+                self.quality_label.config(text="Poor", foreground='red')
+            
+            # Update generator if running
+            if self.is_generating:
+                self.generator.set_frequency(frequency, sample_rate)
+            
+            self.status_var.set(f"Frequency: {frequency} Hz, Sample Rate: {sample_rate:,} Hz, "
+                              f"Samples/Cycle: {samples_per_cycle:.1f}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update frequency: {e}")
+    
+    def on_channel_enabled_changed(self, channel: ChannelConfig, enabled_var: tk.BooleanVar):
+        """Handle channel enable/disable."""
+        enabled = enabled_var.get()
+        self.generator.set_channel_enabled(channel.card_name, channel.channel_number, enabled)
+        
+        # Update status
+        key = f"{channel.card_name}_ch{channel.channel_number}"
+        if key in self.channel_widgets:
+            status_label = self.channel_widgets[key]['status_label']
+            if enabled:
+                status_label.config(text="Enabled" if self.is_generating else "Ready", 
+                                  foreground='green')
+            else:
+                status_label.config(text="Disabled", foreground='gray')
+    
+    def on_amplitude_changed(self, channel: ChannelConfig, amp_var: tk.StringVar):
+        """Handle amplitude change."""
+        try:
+            amplitude_uv = float(amp_var.get())
+            if amplitude_uv < 0:
+                raise ValueError("Amplitude must be positive")
+            
+            self.generator.set_channel_amplitude(channel.card_name, 
+                                                channel.channel_number, 
+                                                amplitude_uv)
+            
+            # Update status
+            key = f"{channel.card_name}_ch{channel.channel_number}"
+            if key in self.channel_widgets:
+                status_label = self.channel_widgets[key]['status_label']
+                amp_mv = amplitude_uv / 1000
+                if amp_mv >= 1:
+                    status_label.config(text=f"{amp_mv:.2f} mV")
+                else:
+                    status_label.config(text=f"{amplitude_uv:.0f} µV")
+        
+        except ValueError as e:
+            messagebox.showerror("Invalid Amplitude", 
+                               f"Please enter a valid positive number.\n{e}")
+            amp_var.set(str(channel.amplitude_uv))
+    
+    def set_all_channels(self, card_name: str, enabled: bool):
+        """Enable or disable all channels on a card."""
+        for ch_num in range(MultiCardGenerator.CHANNELS_PER_CARD):
+            channel = self.generator.get_channel(card_name, ch_num)
+            if channel:
+                self.generator.set_channel_enabled(card_name, ch_num, enabled)
+                
+                # Update UI
+                key = f"{card_name}_ch{ch_num}"
+                if key in self.channel_widgets:
+                    self.channel_widgets[key]['enabled_var'].set(enabled)
+                    status_label = self.channel_widgets[key]['status_label']
+                    if enabled:
+                        status_label.config(text="Enabled" if self.is_generating else "Ready", 
+                                          foreground='green')
+                    else:
+                        status_label.config(text="Disabled", foreground='gray')
+    
+    def set_all_amplitudes(self, card_name: str, amp_entry: ttk.Entry):
+        """Set amplitude for all channels on a card."""
+        try:
+            amplitude_uv = float(amp_entry.get())
+            if amplitude_uv < 0:
+                raise ValueError("Amplitude must be positive")
+            
+            for ch_num in range(MultiCardGenerator.CHANNELS_PER_CARD):
+                channel = self.generator.get_channel(card_name, ch_num)
+                if channel:
+                    self.generator.set_channel_amplitude(card_name, ch_num, amplitude_uv)
+                    
+                    # Update UI
+                    key = f"{card_name}_ch{ch_num}"
+                    if key in self.channel_widgets:
+                        self.channel_widgets[key]['amp_var'].set(str(amplitude_uv))
+            
+            self.status_var.set(f"Set all channels on {card_name} to {amplitude_uv} µV")
+        
+        except ValueError as e:
+            messagebox.showerror("Invalid Amplitude", 
+                               f"Please enter a valid positive number.\n{e}")
+    
+    def start_generation(self):
+        """Start sine wave generation."""
+        try:
+            # Update generator with current frequency and sample rate
+            self.generator.set_frequency(self.current_frequency, self.current_sample_rate)
+            
+            # Start generation
+            result = self.generator.start_generation()
+            
+            if "No channels enabled" in result:
+                messagebox.showwarning("No Channels", result)
+                return
+            
+            self.is_generating = True
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+            self.status_var.set(f"Generating: {self.current_frequency} Hz at "
+                              f"{self.current_sample_rate:,} Hz - {result}")
+            
+            # Update all enabled channel statuses
+            for key, widgets in self.channel_widgets.items():
+                if widgets['enabled_var'].get():
+                    widgets['status_label'].config(text="Active", foreground='darkgreen')
+        
+        except Exception as e:
+            messagebox.showerror("Generation Error", f"Failed to start generation:\n{e}")
+    
+    def stop_generation(self):
+        """Stop sine wave generation."""
+        try:
+            self.generator.stop_generation()
+            self.is_generating = False
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            self.status_var.set("Stopped")
+            
+            # Update all channel statuses
+            for key, widgets in self.channel_widgets.items():
+                if widgets['enabled_var'].get():
+                    widgets['status_label'].config(text="Ready", foreground='green')
+                else:
+                    widgets['status_label'].config(text="Disabled", foreground='gray')
+        
+        except Exception as e:
+            messagebox.showerror("Stop Error", f"Failed to stop generation:\n{e}")
 
 
 def connect_to_chassis():
-    """Connect to the PXIe chassis over Thunderbolt and list available devices."""
+    """Connect to the PXIe chassis and list available devices."""
     try:
-        # Create a system object to interact with NI-DAQmx
         system = nidaqmx.system.System.local()
         
         print("Connecting to PXIe chassis...")
         print(f"NI-DAQmx Driver Version: {system.driver_version}")
         
-        # List all devices in the system
         devices = system.devices
         
         if not devices:
@@ -37,559 +652,34 @@ def connect_to_chassis():
             print(f"    AO Channels: {len(device.ao_physical_chans)}")
             print()
         
-        # Return the first PXIe-4468 device found
-        for device in devices:
-            if "4468" in device.product_type:
-                print(f"PXIe-4468 device found: {device.name}")
-                return device.name
-        
-        # If no 4468 found, return the first device
-        if devices:
-            print(f"Using device: {devices[0].name}")
-            return devices[0].name
+        return True
             
     except Exception as e:
         print(f"Error connecting to chassis: {e}")
         return None
 
 
-def generate_sinewave(frequency, amplitude, sample_rate, duration, offset=0.0):
-    """
-    Generate a sine wave signal with optional DC offset.
-    
-    Args:
-        frequency: Frequency in Hz
-        amplitude: Peak amplitude in volts
-        sample_rate: Samples per second
-        duration: Duration in seconds
-        offset: DC offset in volts (default: 0.0)
-    
-    Returns:
-        numpy array of sine wave samples
-    """
-    num_samples = int(sample_rate * duration)
-    t = np.linspace(0, duration, num_samples, endpoint=False)
-    sine_wave = offset + amplitude * np.sin(2 * np.pi * frequency * t)
-    return sine_wave
-
-
-def output_continuous_sinewave(device_name="Dev1", channel="ao1", 
-                               frequency=50000.0, amplitude=0.1, 
-                               sample_rate=1000000):
-    """
-    Output a continuous sine wave on the specified analog output channel.
-    
-    Args:
-        device_name: Name of the DAQ device (default: "Dev1")
-        channel: Analog output channel (default: "ao1")
-        frequency: Sine wave frequency in Hz (default: 1000 Hz)
-        amplitude: Peak amplitude in volts (default: 1.0 V)
-        sample_rate: Sample rate in Hz (default: 50000 Hz)
-    """
-    try:
-        # Generate one period of the sine wave
-        period = 1.0 / frequency
-        samples = generate_sinewave(frequency, amplitude, sample_rate, period)
-        
-        print(f"Configuring {device_name}/{channel}:")
-        print(f"  Frequency: {frequency} Hz")
-        print(f"  Amplitude: {amplitude} V")
-        print(f"  Sample Rate: {sample_rate} Hz")
-        print(f"  Samples per period: {len(samples)}")
-        
-        # Create analog output task
-        with nidaqmx.Task() as task:
-            # Add analog output channel
-            task.ao_channels.add_ao_voltage_chan(f"{device_name}/{channel}")
-            
-            # Configure timing for continuous output
-            task.timing.cfg_samp_clk_timing(
-                rate=sample_rate,
-                sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
-                samps_per_chan=len(samples)
-            )
-            
-            # Enable regeneration so the waveform repeats
-            task.out_stream.regen_mode = nidaqmx.constants.RegenerationMode.ALLOW_REGENERATION
-            
-            # Write the waveform to the buffer
-            task.write(samples, auto_start=False)
-            
-            # Start the task
-            task.start()
-            
-            print("\nSine wave output started. Press Ctrl+C to stop...")
-            
-            # Keep the task running until interrupted
-            try:
-                while True:
-                    time.sleep(0.1)
-            except KeyboardInterrupt:
-                print("\nStopping output...")
-                task.stop()
-                print("Output stopped.")
-                
-    except nidaqmx.DaqError as e:
-        print(f"\nDAQmx Error: {e}")
-    except Exception as e:
-        print(f"\nError: {e}")
-
-
-class InteractiveOscilloscope:
-    """Interactive oscilloscope with real-time controls."""
-    
-    def __init__(self, device_name="Dev1", ao_channel="ao1", ai_channel="ai1",
-                 initial_frequency=1000.0, initial_amplitude=1.0, sample_rate=50000):
-        """
-        Initialize the interactive oscilloscope.
-        
-        Args:
-            device_name: Name of the DAQ device
-            ao_channel: Analog output channel
-            ai_channel: Analog input channel to monitor
-            initial_frequency: Initial frequency in Hz
-            initial_amplitude: Initial amplitude in volts
-            sample_rate: Sample rate in Hz
-        """
-        self.device_name = device_name
-        self.ao_channel = ao_channel
-        self.ai_channel = ai_channel
-        self.sample_rate = sample_rate
-        self.display_samples = 5000
-        
-        # Signal parameters (thread-safe)
-        self.lock = Lock()
-        self.frequency = initial_frequency
-        self.amplitude = initial_amplitude
-        self.offset = 0.0
-        self.sample_rate_value = sample_rate
-        self.sample_rate_changed = False
-        self.y_min = -5.0
-        self.y_max = 5.0
-        self.auto_scale = True
-        
-        # Data buffers
-        self.input_data = np.zeros(self.display_samples)
-        self.stop_event = Event()
-        self.ao_task = None
-        self.ai_task = None
-        
-        # Set up the plot with controls
-        self.fig = plt.figure(figsize=(15, 9))
-        
-        # Main plot area - adjusted to make room for more controls
-        self.ax = plt.axes([0.1, 0.35, 0.85, 0.55])
-        self.line, = self.ax.plot(self.input_data, 'b-', linewidth=1)
-        self.ax.set_ylim(self.y_min, self.y_max)
-        self.ax.set_xlim(0, self.display_samples)
-        self.ax.set_ylabel('Voltage (V)', fontsize=11)
-        self.ax.set_title(f'Interactive Oscilloscope - Output: {ao_channel} | Input: {ai_channel}', 
-                         fontsize=12, fontweight='bold')
-        self.ax.grid(True, alpha=0.3)
-        
-        time_span = self.display_samples / sample_rate
-        self.ax.set_xlabel(f'Samples (Time span: {time_span*1000:.1f} ms)', fontsize=11)
-        
-        # Output Generator Controls Section
-        gen_label_y = 0.29
-        self.fig.text(0.05, gen_label_y, 'Generator Output:', fontsize=11, fontweight='bold')
-        
-        ax_freq = plt.axes([0.15, 0.25, 0.7, 0.02])
-        ax_amp = plt.axes([0.15, 0.22, 0.7, 0.02])
-        ax_offset = plt.axes([0.15, 0.19, 0.7, 0.02])
-        
-        self.slider_freq = Slider(ax_freq, 'Frequency (Hz)', 10, 50000, 
-                                   valinit=initial_frequency, valstep=10)
-        self.slider_amp = Slider(ax_amp, 'Amplitude (V)', 0.0, 10.0, 
-                                  valinit=initial_amplitude, valstep=0.1)
-        self.slider_offset = Slider(ax_offset, 'DC Offset (V)', -10.0, 10.0,
-                                     valinit=0.0, valstep=0.1)
-        
-        # Oscilloscope Controls Section
-        scope_label_y = 0.16
-        self.fig.text(0.05, scope_label_y, 'Oscilloscope:', fontsize=11, fontweight='bold')
-        
-        ax_srate = plt.axes([0.15, 0.12, 0.7, 0.02])
-        ax_ymin = plt.axes([0.15, 0.08, 0.7, 0.02])
-        ax_ymax = plt.axes([0.15, 0.04, 0.7, 0.02])
-        
-        self.slider_srate = Slider(ax_srate, 'Sample Rate (Hz)', 1000, 200000,
-                                    valinit=sample_rate, valstep=1000)
-        self.slider_ymin = Slider(ax_ymin, 'Y Min (V)', -20, 0, 
-                                   valinit=self.y_min, valstep=0.5)
-        self.slider_ymax = Slider(ax_ymax, 'Y Max (V)', 0, 20, 
-                                   valinit=self.y_max, valstep=0.5)
-        
-        # Auto-scale button
-        ax_auto = plt.axes([0.88, 0.08, 0.1, 0.04])
-        self.btn_auto = Button(ax_auto, 'Auto Scale')
-        
-        # Connect slider callbacks
-        self.slider_freq.on_changed(self.update_frequency)
-        self.slider_amp.on_changed(self.update_amplitude)
-        self.slider_offset.on_changed(self.update_offset)
-        self.slider_srate.on_changed(self.update_sample_rate)
-        self.slider_ymin.on_changed(self.update_ymin)
-        self.slider_ymax.on_changed(self.update_ymax)
-        self.btn_auto.on_clicked(self.toggle_auto_scale)
-        
-        # Add info text
-        self.info_text = self.ax.text(0.02, 0.98, '', transform=self.ax.transAxes,
-                                      verticalalignment='top', fontsize=9,
-                                      bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
-        # Add warning text (initially hidden)
-        self.warning_text = self.ax.text(0.98, 0.98, '', transform=self.ax.transAxes,
-                                         verticalalignment='top', horizontalalignment='right',
-                                         fontsize=9, color='red', fontweight='bold',
-                                         bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
-        
-    def update_frequency(self, val):
-        """Callback for frequency slider."""
-        with self.lock:
-            self.frequency = val
-    
-    def update_amplitude(self, val):
-        """Callback for amplitude slider."""
-        with self.lock:
-            self.amplitude = val
-    
-    def update_offset(self, val):
-        """Callback for DC offset slider."""
-        with self.lock:
-            self.offset = val
-    
-    def update_sample_rate(self, val):
-        """Callback for sample rate slider."""
-        with self.lock:
-            self.sample_rate_value = int(val)
-            self.sample_rate_changed = True
-        # Update time span label
-        time_span = self.display_samples / self.sample_rate_value
-        self.ax.set_xlabel(f'Samples (Time span: {time_span*1000:.1f} ms)', fontsize=11)
-    
-    def update_ymin(self, val):
-        """Callback for Y-min slider."""
-        self.y_min = val
-        self.auto_scale = False
-        self.ax.set_ylim(self.y_min, self.y_max)
-    
-    def update_ymax(self, val):
-        """Callback for Y-max slider."""
-        self.y_max = val
-        self.auto_scale = False
-        self.ax.set_ylim(self.y_min, self.y_max)
-    
-    def toggle_auto_scale(self, event):
-        """Toggle auto-scaling."""
-        self.auto_scale = not self.auto_scale
-        status = "ON" if self.auto_scale else "OFF"
-        print(f"Auto-scale: {status}")
-    
-    def output_thread(self):
-        """Background thread for analog output."""
-        current_task = None
-        try:
-            while not self.stop_event.is_set():
-                # Get current parameters
-                with self.lock:
-                    freq = self.frequency
-                    amp = self.amplitude
-                    offset = self.offset
-                    srate = self.sample_rate_value
-                    rate_changed = self.sample_rate_changed
-                    self.sample_rate_changed = False
-                
-                # Ensure minimum samples per cycle (at least 2, but prefer 10 minimum)
-                samples_per_cycle = srate / freq
-                if samples_per_cycle < 2:
-                    print(f"WARNING: Frequency too high ({freq} Hz) for sample rate ({srate} Hz). Skipping update.")
-                    time.sleep(0.1)
-                    continue
-                
-                # Create new task if needed (initial or sample rate changed)
-                if current_task is None or rate_changed:
-                    if current_task is not None:
-                        try:
-                            current_task.stop()
-                            current_task.close()
-                        except:
-                            pass
-                    
-                    current_task = nidaqmx.Task()
-                    self.ao_task = current_task
-                    current_task.ao_channels.add_ao_voltage_chan(f"{self.device_name}/{self.ao_channel}")
-                    
-                    period = 1.0 / freq
-                    samples = generate_sinewave(freq, amp, srate, period, offset)
-                    
-                    # Ensure at least 2 samples
-                    if len(samples) < 2:
-                        print(f"ERROR: Not enough samples ({len(samples)}). Skipping.")
-                        continue
-                    
-                    current_task.timing.cfg_samp_clk_timing(
-                        rate=srate,
-                        sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
-                        samps_per_chan=len(samples)
-                    )
-                    current_task.out_stream.regen_mode = nidaqmx.constants.RegenerationMode.ALLOW_REGENERATION
-                    current_task.write(samples, auto_start=False)
-                    current_task.start()
-                    
-                    last_freq = freq
-                    last_amp = amp
-                    last_offset = offset
-                    last_srate = srate
-                    
-                    if rate_changed:
-                        print(f"Sample rate changed to {srate} Hz")
-                else:
-                    # Update waveform if frequency, amplitude, or offset changed
-                    if freq != last_freq or amp != last_amp or offset != last_offset:
-                        period = 1.0 / freq
-                        samples = generate_sinewave(freq, amp, srate, period, offset)
-                        
-                        # Ensure at least 2 samples
-                        if len(samples) < 2:
-                            print(f"ERROR: Not enough samples ({len(samples)}). Skipping.")
-                            time.sleep(0.1)
-                            continue
-                        
-                        current_task.stop()
-                        
-                        # Reconfigure with new sample count if needed
-                        current_task.timing.cfg_samp_clk_timing(
-                            rate=srate,
-                            sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
-                            samps_per_chan=len(samples)
-                        )
-                        current_task.write(samples, auto_start=False)
-                        current_task.start()
-                        
-                        last_freq = freq
-                        last_amp = amp
-                        last_offset = offset
-                
-                time.sleep(0.1)
-            
-            if current_task is not None:
-                current_task.stop()
-                current_task.close()
-                
-        except Exception as e:
-            print(f"Output error: {e}")
-            if current_task is not None:
-                try:
-                    current_task.close()
-                except:
-                    pass
-    
-    def acquisition_thread(self):
-        """Background thread for continuous data acquisition."""
-        current_task = None
-        last_srate = None
-        
-        try:
-            while not self.stop_event.is_set():
-                # Check if sample rate changed
-                with self.lock:
-                    srate = self.sample_rate_value
-                
-                # Recreate task if sample rate changed
-                if current_task is None or srate != last_srate:
-                    if current_task is not None:
-                        try:
-                            current_task.stop()
-                            current_task.close()
-                        except:
-                            pass
-                    
-                    current_task = nidaqmx.Task()
-                    self.ai_task = current_task
-                    current_task.ai_channels.add_ai_voltage_chan(f"{self.device_name}/{self.ai_channel}")
-                    
-                    current_task.timing.cfg_samp_clk_timing(
-                        rate=srate,
-                        sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
-                        samps_per_chan=self.display_samples
-                    )
-                    
-                    current_task.start()
-                    last_srate = srate
-                
-                # Read data
-                try:
-                    samples = current_task.read(number_of_samples_per_channel=self.display_samples)
-                    self.input_data = np.array(samples)
-                except:
-                    pass  # Handle buffer errors gracefully
-                
-                time.sleep(0.05)
-            
-            if current_task is not None:
-                current_task.stop()
-                current_task.close()
-                
-        except nidaqmx.DaqError as e:
-            print(f"\nDAQmx Error in acquisition: {e}")
-        except Exception as e:
-            print(f"\nError in acquisition: {e}")
-        finally:
-            if current_task is not None:
-                try:
-                    current_task.close()
-                except:
-                    pass
-    
-    def animate(self, frame):
-        """Animation function to update the plot."""
-        self.line.set_ydata(self.input_data)
-        
-        # Auto-scale Y-axis based on data
-        if self.auto_scale and len(self.input_data) > 0:
-            data_min, data_max = np.min(self.input_data), np.max(self.input_data)
-            margin = max((data_max - data_min) * 0.1, 0.5)
-            self.y_min = data_min - margin
-            self.y_max = data_max + margin
-            self.ax.set_ylim(self.y_min, self.y_max)
-            
-            # Update sliders without triggering callbacks
-            self.slider_ymin.eventson = False
-            self.slider_ymax.eventson = False
-            self.slider_ymin.set_val(self.y_min)
-            self.slider_ymax.set_val(self.y_max)
-            self.slider_ymin.eventson = True
-            self.slider_ymax.eventson = True
-        
-        # Update info text
-        with self.lock:
-            freq = self.frequency
-            amp = self.amplitude
-            offset = self.offset
-            srate = self.sample_rate_value
-        
-        # Calculate samples per cycle
-        samples_per_cycle = srate / freq if freq > 0 else 0
-        
-        # Generate info text
-        if len(self.input_data) > 0:
-            rms = np.sqrt(np.mean(self.input_data**2))
-            peak = np.max(np.abs(self.input_data))
-            info = f'Output: {freq:.1f} Hz, {amp:.2f} V, Offset: {offset:.2f} V @ {srate/1000:.0f} kS/s\nSamples/Cycle: {samples_per_cycle:.1f} | Input RMS: {rms:.3f} V | Peak: {peak:.3f} V'
-        else:
-            info = f'Output: {freq:.1f} Hz, {amp:.2f} V, Offset: {offset:.2f} V\nSamples/Cycle: {samples_per_cycle:.1f}'
-        
-        self.info_text.set_text(info)
-        
-        # Update warning text based on samples per cycle
-        if samples_per_cycle < 2:
-            self.warning_text.set_text(f'⚠ ERROR\nInvalid!\n({samples_per_cycle:.1f} samples/cycle)\nMUST be ≥ 2\nReduce frequency!')
-        elif samples_per_cycle < 10:
-            self.warning_text.set_text(f'⚠ WARNING\nLow Quality\n({samples_per_cycle:.1f} samples/cycle)\nIncrease sample rate\nor decrease frequency')
-        elif samples_per_cycle < 20:
-            self.warning_text.set_text(f'⚠ CAUTION\nModerate Quality\n({samples_per_cycle:.1f} samples/cycle)')
-        else:
-            self.warning_text.set_text('')  # Clear warning
-        
-        return self.line, self.info_text, self.warning_text
-    
-    def start(self):
-        """Start the interactive oscilloscope."""
-        # Start output thread
-        out_thread = Thread(target=self.output_thread, daemon=True)
-        out_thread.start()
-        
-        # Start acquisition thread
-        acq_thread = Thread(target=self.acquisition_thread, daemon=True)
-        acq_thread.start()
-        
-        # Give threads time to start
-        time.sleep(0.5)
-        
-        # Start animation
-        ani = animation.FuncAnimation(
-            self.fig, self.animate, interval=50, blit=True, cache_frame_data=False
-        )
-        
-        plt.show()
-        
-        # Clean up when window is closed
-        self.stop_event.set()
-        time.sleep(0.2)
-        if self.ao_task:
-            try:
-                self.ao_task.stop()
-            except:
-                pass
-        if self.ai_task:
-            try:
-                self.ai_task.stop()
-            except:
-                pass
-
-
-def run_interactive_oscilloscope(device_name="Dev1", ao_channel="ao1", ai_channel="ai1",
-                                frequency=1000.0, amplitude=1.0, sample_rate=50000):
-    """
-    Run interactive oscilloscope with real-time controls.
-    
-    Args:
-        device_name: Name of the DAQ device
-        ao_channel: Analog output channel
-        ai_channel: Analog input channel for monitoring
-        frequency: Initial sine wave frequency in Hz
-        amplitude: Initial peak amplitude in volts
-        sample_rate: Sample rate in Hz
-    """
-    print(f"Starting interactive oscilloscope:")
-    print(f"  Device: {device_name}")
-    print(f"  Output: {ao_channel}")
-    print(f"  Input: {ai_channel}")
-    print(f"  Initial Frequency: {frequency} Hz")
-    print(f"  Initial Amplitude: {amplitude} V")
-    print(f"  Sample Rate: {sample_rate} Hz")
-    print("\nUse the sliders to adjust parameters in real-time.")
-    print("Close the plot window to stop.\n")
-    
-    # Create and start interactive oscilloscope
-    scope = InteractiveOscilloscope(
-        device_name=device_name,
-        ao_channel=ao_channel,
-        ai_channel=ai_channel,
-        initial_frequency=frequency,
-        initial_amplitude=amplitude,
-        sample_rate=sample_rate
-    )
-    scope.start()
-
-
 def main():
     """Main function to run the application."""
-    device_name = connect_to_chassis()
+    print("=" * 60)
+    print("PXIe-4468 Multi-Card Sine Wave Generator")
+    print("=" * 60)
     
-    if device_name:
-        print(f"\nSuccessfully connected to device: {device_name}")
+    # Check connection to chassis
+    if connect_to_chassis():
+        print("\nLaunching GUI...")
         
-        # Configuration parameters (easily adjustable)
-        DEVICE = "SV1"  # Change if your device has a different name
-        AO_CHANNEL = "ao1"
-        AI_CHANNEL = "ai1"
-        FREQUENCY = 1000.0  # Hz - initial frequency
-        AMPLITUDE = 1.0     # Volts - initial amplitude
-        SAMPLE_RATE = 50000 # Hz - sample rate
-        
-        print(f"\nStarting interactive oscilloscope with controls...")
-        run_interactive_oscilloscope(
-            device_name=DEVICE,
-            ao_channel=AO_CHANNEL,
-            ai_channel=AI_CHANNEL,
-            frequency=FREQUENCY,
-            amplitude=AMPLITUDE,
-            sample_rate=SAMPLE_RATE
-        )
+        # Create and run GUI
+        root = tk.Tk()
+        app = PXIeControlGUI(root)
+        root.mainloop()
     else:
         print("\nFailed to connect to PXIe chassis.")
+        print("Please ensure:")
+        print("  1. The PXIe chassis is powered on")
+        print("  2. Thunderbolt connection is active")
+        print("  3. NI-DAQmx drivers are installed")
+        print("  4. Device names are configured as SV1, SV2, SV3, SV4 in NI MAX")
 
 
 if __name__ == "__main__":
