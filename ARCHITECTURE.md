@@ -353,3 +353,152 @@ Every layer has error handling:
 ├── DAQmx: Try/except with cleanup
 └── CSV: Fallback to defaults
 ```
+
+## Advanced Features: Dual-Frequency Generation
+
+### Concept
+
+The system can be extended to generate combined signals by mathematically summing multiple sine waves before output. This is useful for direction-finding equipment and other applications requiring composite signals.
+
+### Use Case: Direction-Finding Equipment
+
+Direction-finding systems often use phase relationships between two frequencies to determine transmitter bearing. A common approach:
+
+- **Primary frequency**: Base signal (e.g., 1 kHz)
+- **Secondary frequency**: Half the primary (e.g., 500 Hz)
+- **Combined output**: Sum of both signals
+- **Phase relationship**: Allows receiver to determine direction
+
+### Implementation Approach
+
+```python
+def _generate_dual_frequency_waveform(self, frequency1, frequency2, 
+                                      amplitude1, amplitude2, 
+                                      sample_rate, num_samples):
+    """
+    Generate combined dual-frequency waveform.
+    
+    Args:
+        frequency1: Primary frequency in Hz (e.g., 1000)
+        frequency2: Secondary frequency in Hz (e.g., 500)
+        amplitude1: Primary amplitude in volts
+        amplitude2: Secondary amplitude in volts
+        sample_rate: DAC sample rate in Hz
+        num_samples: Number of samples to generate
+    
+    Returns:
+        numpy array of combined waveform
+    """
+    duration = num_samples / sample_rate
+    t = np.linspace(0, duration, num_samples, endpoint=False)
+    
+    # Generate both sine waves
+    primary = amplitude1 * np.sin(2 * np.pi * frequency1 * t)
+    secondary = amplitude2 * np.sin(2 * np.pi * frequency2 * t)
+    
+    # Combine signals
+    combined = primary + secondary
+    
+    # Prevent clipping - scale if exceeds ±10V
+    max_voltage = np.max(np.abs(combined))
+    if max_voltage > 10.0:
+        scale_factor = (10.0 / max_voltage) * 0.95  # 95% to leave headroom
+        combined = combined * scale_factor
+        print(f"Warning: Signal scaled by {scale_factor:.3f} to prevent clipping")
+    
+    return combined
+```
+
+### Example: 1 kHz + 500 Hz Direction-Finding Signal
+
+```python
+# Configuration
+primary_freq = 1000      # 1 kHz primary
+secondary_freq = 500     # 500 Hz secondary (2:1 ratio)
+primary_amplitude = 4.0  # 4V peak
+secondary_amplitude = 3.0 # 3V peak
+sample_rate = 100000     # 100 kHz (100 samples/cycle for 1 kHz)
+
+# Generate combined signal
+combined_signal = _generate_dual_frequency_waveform(
+    frequency1=primary_freq,
+    frequency2=secondary_freq,
+    amplitude1=primary_amplitude,
+    amplitude2=secondary_amplitude,
+    sample_rate=sample_rate,
+    num_samples=10000
+)
+
+# Result: 7V peak (4V + 3V), well within ±10V limits
+```
+
+### Key Considerations
+
+#### 1. Sample Rate Selection
+- Must satisfy Nyquist for **both** frequencies
+- Current system uses 100+ samples/cycle
+- For 1 kHz primary: 100 kHz+ sample rate recommended
+- For higher frequencies: use 2 MHz max (PXIe-4468 limit)
+
+#### 2. Amplitude Management
+- Combined peak = amplitude1 + amplitude2 (worst case)
+- Must not exceed ±10V hardware limit
+- Automatic scaling prevents clipping
+- Monitor with oscilloscope feature to verify
+
+#### 3. Phase Coherence
+- Both signals generated from same time array
+- Ensures consistent phase relationship
+- Critical for direction-finding accuracy
+- Regenerated together maintains coherence
+
+#### 4. Frequency Relationships
+- Common ratios: 2:1, 3:1, 4:1
+- Example: 1000 Hz + 500 Hz (2:1)
+- Example: 1500 Hz + 500 Hz (3:1)
+- Any mathematical relationship possible
+
+### Integration with Current System
+
+To add dual-frequency support, modify `MultiCardGenerator._generate_waveforms()`:
+
+**Current behavior** (single frequency):
+```python
+# Around line 465-490 in main.py
+sine_wave = np.sin(2 * np.pi * self.frequency * t)
+channel_samples[ch] = sine_wave * amplitude_v
+```
+
+**Enhanced for dual-frequency**:
+```python
+# Option 1: Per-channel dual-frequency configuration
+sine_wave1 = np.sin(2 * np.pi * self.frequency * t)
+sine_wave2 = np.sin(2 * np.pi * self.frequency2 * t)  # New parameter
+combined = sine_wave1 + (sine_wave2 * self.freq2_ratio)  # Adjustable mix
+channel_samples[ch] = combined * amplitude_v
+
+# Option 2: Global dual-frequency mode
+if self.dual_freq_enabled:
+    primary = np.sin(2 * np.pi * self.frequency * t)
+    secondary = np.sin(2 * np.pi * (self.frequency / 2) * t)  # Half frequency
+    combined = (primary * self.primary_mix) + (secondary * self.secondary_mix)
+    channel_samples[ch] = combined * amplitude_v
+```
+
+### Benefits for RF Testing
+
+1. **Direction calibration**: Test bearing accuracy
+2. **Multi-tone response**: Verify amplifier linearity
+3. **Intermodulation testing**: Check for distortion products
+4. **Beat frequency generation**: Low-frequency envelope for testing
+5. **Complex signal scenarios**: Real-world signal simulation
+
+### Future Enhancement Ideas
+
+- GUI option to enable dual-frequency mode
+- Adjustable frequency ratio (1:2, 1:3, etc.)
+- Independent amplitude control for each frequency
+- Phase offset control
+- Three or more frequency combinations
+- Arbitrary waveform selection (sine, square, triangle)
+- CSV-based frequency pair definitions
