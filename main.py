@@ -13,6 +13,11 @@ from tkinter import ttk, messagebox
 from threading import Thread, Event, Lock
 from dataclasses import dataclass
 from typing import List, Dict, Optional
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 
 @dataclass
@@ -104,7 +109,8 @@ class MultiCardGenerator:
     CARD_NAMES = ["SV1", "SV2", "SV3", "SV4"]
     
     def __init__(self):
-        self.tasks: Dict[str, nidaqmx.Task] = {}
+        self.ao_tasks: Dict[str, nidaqmx.Task] = {}  # Analog output tasks
+        self.ai_tasks: Dict[str, nidaqmx.Task] = {}  # Analog input tasks
         self.lock = Lock()
         self.running = False
         self.stop_event = Event()
@@ -113,6 +119,13 @@ class MultiCardGenerator:
         self.frequency = 1000.0  # Hz
         self.sample_rate = 100000  # Hz
         self.channels: List[ChannelConfig] = []
+        
+        # Input data storage (RMS and peak per channel)
+        self.input_data: Dict[str, Dict[str, float]] = {}  # {"SV1_0": {"rms": 0.0, "peak": 0.0}}
+        
+        # Oscilloscope waveform buffer (stores last N samples for each channel)
+        self.scope_buffer_size = 5000  # Number of samples to store
+        self.scope_data: Dict[str, np.ndarray] = {}  # {"SV1_0": array of samples}
         
         # Initialize all channels for all cards (disabled by default)
         for card_name in self.CARD_NAMES:
@@ -165,18 +178,36 @@ class MultiCardGenerator:
     
     def start_generation(self) -> str:
         """Start continuous sine wave generation. Returns status message."""
+        print("\n" + "="*60)
+        print("START GENERATION CALLED")
+        print("="*60)
+        
         if self.running:
+            print("Generator already running")
             return "Generator already running"
         
         # Check if any channels are enabled
         enabled_channels = [ch for ch in self.channels if ch.enabled]
+        print(f"Enabled channels: {len(enabled_channels)}")
+        
         if not enabled_channels:
+            print("ERROR: No channels enabled!")
             return "No channels enabled. Please enable at least one channel."
+        
+        # Show which channels are enabled
+        for ch in enabled_channels:
+            print(f"  - {ch.card_name}/AO{ch.channel_number}: {ch.amplitude_uv} µV")
+        
+        print(f"Frequency: {self.frequency} Hz")
+        print(f"Sample Rate: {self.sample_rate} Hz")
         
         self.stop_event.clear()
         self.running = True
         self.output_thread = Thread(target=self._output_worker, daemon=True)
         self.output_thread.start()
+        
+        print(f"Background thread started")
+        print("="*60)
         
         return f"Started generation on {len(enabled_channels)} channel(s)"
     
@@ -192,92 +223,363 @@ class MultiCardGenerator:
         if self.output_thread:
             self.output_thread.join(timeout=2.0)
         
-        # Close all tasks
-        for task_name, task in list(self.tasks.items()):
+        # Close all AO tasks
+        for task_name, task in list(self.ao_tasks.items()):
             try:
                 task.stop()
                 task.close()
             except:
                 pass
-        self.tasks.clear()
+        self.ao_tasks.clear()
+        
+        # Close all AI tasks
+        for task_name, task in list(self.ai_tasks.items()):
+            try:
+                task.stop()
+                task.close()
+            except:
+                pass
+        self.ai_tasks.clear()
     
     def _output_worker(self):
         """Background thread that manages continuous output."""
+        print("\n*** OUTPUT WORKER THREAD STARTED ***")
+        tasks_created = False
         try:
-            while not self.stop_event.is_set():
-                with self.lock:
-                    freq = self.frequency
-                    srate = self.sample_rate
-                    # Create copy of enabled channels
-                    enabled_chs = [(ch.card_name, ch.channel_number, ch.amplitude_uv) 
-                                  for ch in self.channels if ch.enabled]
+            # Initial task creation
+            with self.lock:
+                freq = self.frequency
+                srate = self.sample_rate
+                # Create copy of enabled channels
+                enabled_chs = [(ch.card_name, ch.channel_number, ch.amplitude_uv) 
+                              for ch in self.channels if ch.enabled]
+            
+            print(f"Initial setup: {len(enabled_chs)} enabled channels")
+            
+            # Group channels by card
+            cards = {}
+            for card_name, ch_num, amp_uv in enabled_chs:
+                if card_name not in cards:
+                    cards[card_name] = []
+                cards[card_name].append((ch_num, amp_uv))
+            
+            print(f"Cards to configure: {list(cards.keys())}")
+            
+            # Create tasks for each card
+            for card_name, channel_list in cards.items():
+                task_name = card_name
                 
-                # Group channels by card
-                cards = {}
-                for card_name, ch_num, amp_uv in enabled_chs:
-                    if card_name not in cards:
-                        cards[card_name] = []
-                    cards[card_name].append((ch_num, amp_uv))
-                
-                # Update tasks for each card
-                for card_name, channel_list in cards.items():
-                    task_name = card_name
+                print(f"\nCreating task for {card_name}...")
+                try:
+                    task = nidaqmx.Task()
+                    print(f"  Task object created")
                     
-                    # Create task if it doesn't exist
-                    if task_name not in self.tasks:
-                        try:
-                            task = nidaqmx.Task()
-                            
-                            # Add all channels for this card
-                            for ch_num, _ in channel_list:
-                                task.ao_channels.add_ao_voltage_chan(
-                                    f"{card_name}/ao{ch_num}",
-                                    min_val=-10.0,
-                                    max_val=10.0
-                                )
-                            
-                            # Configure timing
-                            period = 1.0 / freq
-                            samples = self.generate_sinewave(freq, 1.0, srate)  # 1V reference
-                            
-                            task.timing.cfg_samp_clk_timing(
-                                rate=srate,
-                                sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
-                                samps_per_chan=len(samples)
+                    # Add all channels for this card
+                    for ch_num, amp_uv in channel_list:
+                        channel_name = f"{card_name}/ao{ch_num}"
+                        print(f"  Adding channel: {channel_name} ({amp_uv} µV)")
+                        task.ao_channels.add_ao_voltage_chan(
+                            channel_name,
+                            min_val=-10.0,
+                            max_val=10.0
+                        )
+                    
+                    # Configure timing
+                    period = 1.0 / freq
+                    samples = self.generate_sinewave(freq, 1.0, srate)  # 1V reference
+                    print(f"  Samples per period: {len(samples)}")
+                    
+                    task.timing.cfg_samp_clk_timing(
+                        rate=srate,
+                        sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
+                        samps_per_chan=len(samples)
+                    )
+                    print(f"  Timing configured: {srate} Hz")
+                    
+                    task.out_stream.regen_mode = nidaqmx.constants.RegenerationMode.ALLOW_REGENERATION
+                    
+                    # Generate waveforms for each channel with individual amplitudes
+                    waveforms = []
+                    for ch_num, amp_uv in channel_list:
+                        amp_v = amp_uv / 1e6  # Convert microvolts to volts
+                        waveform = self.generate_sinewave(freq, amp_v, srate)
+                        waveforms.append(waveform)
+                        print(f"  Generated waveform for AO{ch_num}: {amp_v:.6f} V")
+                    
+                    # Write interleaved data
+                    print(f"  Writing {len(waveforms)} waveforms...")
+                    task.write(waveforms, auto_start=False)
+                    print(f"  Starting task...")
+                    task.start()
+                    
+                    self.ao_tasks[task_name] = task
+                    tasks_created = True
+                    print(f"  ✓ Task started successfully for {card_name}")
+                    
+                except Exception as e:
+                    print(f"  ✗ ERROR creating task for {card_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            # Create analog input tasks to monitor outputs
+            if tasks_created:
+                print("\n--- Creating Analog Input Monitoring ---")
+                for card_name, channel_list in cards.items():
+                    try:
+                        ai_task = nidaqmx.Task()
+                        print(f"Creating AI task for {card_name}...")
+                        
+                        # Add AI channels matching the AO channels
+                        for ch_num, _ in channel_list:
+                            channel_name = f"{card_name}/ai{ch_num}"
+                            print(f"  Adding AI channel: {channel_name}")
+                            ai_task.ai_channels.add_ai_voltage_chan(
+                                channel_name,
+                                min_val=-10.0,
+                                max_val=10.0
                             )
-                            task.out_stream.regen_mode = nidaqmx.constants.RegenerationMode.ALLOW_REGENERATION
+                        
+                        # Configure timing for continuous acquisition
+                        ai_task.timing.cfg_samp_clk_timing(
+                            rate=srate,
+                            sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
+                            samps_per_chan=1000  # Read 1000 samples at a time
+                        )
+                        
+                        ai_task.start()
+                        self.ai_tasks[card_name] = ai_task
+                        print(f"  ✓ AI task started for {card_name}")
+                        
+                    except Exception as e:
+                        print(f"  ⚠ Could not create AI task for {card_name}: {e}")
+                        # Continue without AI monitoring
+            
+            if tasks_created:
+                print("\n✓ ALL TASKS CREATED - Generation running continuously")
+                print("  (Monitoring inputs and waiting for stop signal...)")
+            
+            # Keep thread alive and update input measurements
+            while not self.stop_event.is_set():
+                # Read and process input data
+                for card_name, ai_task in list(self.ai_tasks.items()):
+                    try:
+                        # Read available samples
+                        data = ai_task.read(number_of_samples_per_channel=1000)
+                        
+                        # Process each channel
+                        if isinstance(data[0], list):
+                            # Multiple channels
+                            for ch_idx, channel_data in enumerate(data):
+                                channel_data = np.array(channel_data)
+                                rms = np.sqrt(np.mean(channel_data**2))
+                                peak = np.max(np.abs(channel_data))
+                                
+                                key = f"{card_name}_{ch_idx}"
+                                with self.lock:
+                                    self.input_data[key] = {"rms": rms, "peak": peak}
+                                    # Store waveform for oscilloscope
+                                    if key not in self.scope_data:
+                                        self.scope_data[key] = channel_data[:self.scope_buffer_size]
+                                    else:
+                                        # Roll buffer and append new data
+                                        current = self.scope_data[key]
+                                        new_data = np.concatenate([current, channel_data])
+                                        self.scope_data[key] = new_data[-self.scope_buffer_size:]
+                        else:
+                            # Single channel
+                            channel_data = np.array(data)
+                            rms = np.sqrt(np.mean(channel_data**2))
+                            peak = np.max(np.abs(channel_data))
                             
-                            # Generate waveforms for each channel with individual amplitudes
-                            waveforms = []
-                            for ch_num, amp_uv in channel_list:
-                                amp_v = amp_uv / 1e6  # Convert microvolts to volts
-                                waveform = self.generate_sinewave(freq, amp_v, srate)
-                                waveforms.append(waveform)
-                            
-                            # Write interleaved data
-                            task.write(waveforms, auto_start=False)
-                            task.start()
-                            
-                            self.tasks[task_name] = task
-                            
-                        except Exception as e:
-                            print(f"Error creating task for {card_name}: {e}")
-                            continue
+                            key = f"{card_name}_0"
+                            with self.lock:
+                                self.input_data[key] = {"rms": rms, "peak": peak}
+                                # Store waveform for oscilloscope
+                                if key not in self.scope_data:
+                                    self.scope_data[key] = channel_data[:self.scope_buffer_size]
+                                else:
+                                    # Roll buffer and append new data
+                                    current = self.scope_data[key]
+                                    new_data = np.concatenate([current, channel_data])
+                                    self.scope_data[key] = new_data[-self.scope_buffer_size:]
+                    except:
+                        pass  # Continue if no data available
                 
-                # Sleep for a bit before checking for updates
-                time.sleep(0.1)
+                time.sleep(0.05)
+            
+            print("\n*** STOPPING OUTPUT ***")
         
         except Exception as e:
             print(f"Output worker error: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             # Clean up
-            for task in list(self.tasks.values()):
+            print("Cleaning up tasks...")
+            for task in list(self.ao_tasks.values()):
                 try:
                     task.stop()
                     task.close()
                 except:
                     pass
-            self.tasks.clear()
+            self.ao_tasks.clear()
+            
+            for task in list(self.ai_tasks.values()):
+                try:
+                    task.stop()
+                    task.close()
+                except:
+                    pass
+            self.ai_tasks.clear()
+            print("*** OUTPUT WORKER THREAD ENDED ***")
+
+
+    def get_input_measurements(self, card_name: str, channel_number: int) -> Dict[str, float]:
+        """Get RMS and peak measurements for a specific input channel."""
+        key = f"{card_name}_{channel_number}"
+        with self.lock:
+            return self.input_data.get(key, {"rms": 0.0, "peak": 0.0})
+    
+    def get_scope_data(self, card_name: str, channel_number: int) -> np.ndarray:
+        """Get oscilloscope waveform data for a specific input channel."""
+        key = f"{card_name}_{channel_number}"
+        with self.lock:
+            return self.scope_data.get(key, np.array([]))
+
+
+class OscilloscopeWindow:
+    """Oscilloscope display window for viewing real-time waveforms."""
+    
+    def __init__(self, parent, generator: MultiCardGenerator, card_name: str, channel_number: int):
+        self.generator = generator
+        self.card_name = card_name
+        self.channel_number = channel_number
+        self.window = tk.Toplevel(parent)
+        self.window.title(f"Oscilloscope - {card_name}/AI{channel_number}")
+        self.window.geometry("900x600")
+        
+        self.is_running = True
+        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Create matplotlib figure
+        self.fig = Figure(figsize=(9, 5), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_xlabel('Time (ms)')
+        self.ax.set_ylabel('Voltage (V)')
+        self.ax.set_title(f'Input Waveform - {card_name}/AI{channel_number}')
+        self.ax.grid(True, alpha=0.3)
+        
+        # Initialize line
+        self.line, = self.ax.plot([], [], 'b-', linewidth=1)
+        
+        # Clipping indicator
+        self.clip_text = self.ax.text(0.02, 0.98, '', transform=self.ax.transAxes,
+                                      verticalalignment='top', fontsize=10, color='red',
+                                      fontweight='bold',
+                                      bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
+        
+        # Stats text
+        self.stats_text = self.ax.text(0.98, 0.98, '', transform=self.ax.transAxes,
+                                       verticalalignment='top', horizontalalignment='right',
+                                       fontsize=9,
+                                       bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+        
+        # Canvas
+        self.canvas = FigureCanvasTkAgg(self.fig, self.window)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        # Controls frame
+        controls = ttk.Frame(self.window)
+        controls.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(controls, text="Y-Scale:").pack(side=tk.LEFT, padx=5)
+        self.yscale_var = tk.StringVar(value="Auto")
+        yscale_combo = ttk.Combobox(controls, textvariable=self.yscale_var, width=10, 
+                                    values=["Auto", "±1V", "±2V", "±5V", "±10V"], state='readonly')
+        yscale_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(controls, text="Time Span:").pack(side=tk.LEFT, padx=5)
+        self.timespan_var = tk.StringVar(value="50ms")
+        timespan_combo = ttk.Combobox(controls, textvariable=self.timespan_var, width=10,
+                                      values=["10ms", "25ms", "50ms", "100ms", "200ms"], state='readonly')
+        timespan_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(controls, text="Freeze", command=self.toggle_freeze).pack(side=tk.LEFT, padx=5)
+        self.frozen = False
+        
+        # Start update loop
+        self.update_plot()
+    
+    def toggle_freeze(self):
+        """Toggle freeze/run mode."""
+        self.frozen = not self.frozen
+    
+    def on_close(self):
+        """Handle window close."""
+        self.is_running = False
+        self.window.destroy()
+    
+    def update_plot(self):
+        """Update the oscilloscope display."""
+        if not self.is_running:
+            return
+        
+        if not self.frozen:
+            # Get waveform data
+            data = self.generator.get_scope_data(self.card_name, self.channel_number)
+            
+            if len(data) > 0:
+                # Parse time span
+                timespan_str = self.timespan_var.get()
+                timespan_ms = float(timespan_str.replace('ms', ''))
+                
+                # Calculate how many samples to show
+                sample_rate = self.generator.sample_rate
+                samples_to_show = int((timespan_ms / 1000.0) * sample_rate)
+                samples_to_show = min(samples_to_show, len(data))
+                
+                # Get last N samples
+                display_data = data[-samples_to_show:]
+                
+                # Create time axis in milliseconds
+                time_ms = np.arange(len(display_data)) / sample_rate * 1000
+                
+                # Update plot
+                self.line.set_data(time_ms, display_data)
+                self.ax.set_xlim(0, timespan_ms)
+                
+                # Update Y scale
+                yscale = self.yscale_var.get()
+                if yscale == "Auto":
+                    margin = max(np.max(np.abs(display_data)) * 0.1, 0.1)
+                    self.ax.set_ylim(np.min(display_data) - margin, np.max(display_data) + margin)
+                else:
+                    limit = float(yscale.replace('±', '').replace('V', ''))
+                    self.ax.set_ylim(-limit, limit)
+                
+                # Check for clipping (near ±10V)
+                max_val = np.max(np.abs(display_data))
+                if max_val > 9.5:
+                    self.clip_text.set_text('⚠ CLIPPING DETECTED!')
+                elif max_val > 9.0:
+                    self.clip_text.set_text('⚠ Near Clipping')
+                else:
+                    self.clip_text.set_text('')
+                
+                # Update stats
+                rms = np.sqrt(np.mean(display_data**2))
+                peak = np.max(np.abs(display_data))
+                freq_est = self.generator.frequency
+                stats = f'RMS: {rms:.4f} V\nPeak: {peak:.4f} V\nFreq: {freq_est:.1f} Hz'
+                self.stats_text.set_text(stats)
+                
+                self.canvas.draw()
+        
+        # Schedule next update
+        if self.is_running:
+            self.window.after(50, self.update_plot)  # Update at 20 Hz
 
 
 class PXIeControlGUI:
@@ -302,6 +604,9 @@ class PXIeControlGUI:
         
         # Load initial frequency
         self.update_frequency_selection()
+        
+        # Start periodic update of input measurements
+        self.update_input_displays()
     
     def setup_ui(self):
         """Create the user interface."""
@@ -406,10 +711,13 @@ class PXIeControlGUI:
         # Channel headers
         headers = ttk.Frame(scrollable_frame)
         headers.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(headers, text="Channel", width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(headers, text="Enabled", width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(headers, text="Amplitude (µV)", width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Label(headers, text="Status", width=20).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Ch", width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="En", width=4).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Output (µV)", width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="RMS (V)", width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Peak (V)", width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Status", width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(headers, text="Scope", width=8).pack(side=tk.LEFT, padx=5)
         
         # Create widgets for each channel
         for ch_num in range(MultiCardGenerator.CHANNELS_PER_CARD):
@@ -429,7 +737,7 @@ class PXIeControlGUI:
         
         # Channel label
         ttk.Label(frame, text=f"AO{channel.channel_number}", 
-                 width=10).pack(side=tk.LEFT, padx=5)
+                 width=6, font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=5)
         
         # Enable checkbox
         enabled_var = tk.BooleanVar(value=channel.enabled)
@@ -439,21 +747,49 @@ class PXIeControlGUI:
         
         # Amplitude entry
         amp_var = tk.StringVar(value=str(channel.amplitude_uv))
-        amp_entry = ttk.Entry(frame, textvariable=amp_var, width=15)
+        amp_entry = ttk.Entry(frame, textvariable=amp_var, width=12)
         amp_entry.pack(side=tk.LEFT, padx=5)
         amp_entry.bind('<Return>', lambda e: self.on_amplitude_changed(channel, amp_var))
         amp_entry.bind('<FocusOut>', lambda e: self.on_amplitude_changed(channel, amp_var))
         
+        # Input RMS display
+        rms_label = ttk.Label(frame, text="0.000 V", width=10, anchor=tk.E, 
+                             font=('Courier', 9), foreground='blue')
+        rms_label.pack(side=tk.LEFT, padx=5)
+        
+        # Input peak display
+        peak_label = ttk.Label(frame, text="0.000 V", width=10, anchor=tk.E,
+                              font=('Courier', 9), foreground='darkgreen')
+        peak_label.pack(side=tk.LEFT, padx=5)
+        
         # Status label
-        status_label = ttk.Label(frame, text="Idle", width=20, foreground='gray')
+        status_label = ttk.Label(frame, text="Idle", width=12, foreground='gray')
         status_label.pack(side=tk.LEFT, padx=5)
+        
+        # Oscilloscope button
+        scope_btn = ttk.Button(frame, text="📊 Scope", width=8,
+                              command=lambda: self.open_oscilloscope(channel))
+        scope_btn.pack(side=tk.LEFT, padx=5)
         
         # Store widgets for later access
         self.channel_widgets[key] = {
             'enabled_var': enabled_var,
             'amp_var': amp_var,
+            'rms_label': rms_label,
+            'peak_label': peak_label,
             'status_label': status_label
         }
+    
+    def open_oscilloscope(self, channel: ChannelConfig):
+        """Open oscilloscope window for a specific channel."""
+        if not self.is_generating:
+            messagebox.showinfo("Oscilloscope", 
+                              "Please start generation first to view waveforms.")
+            return
+        
+        # Create oscilloscope window
+        OscilloscopeWindow(self.root, self.generator, 
+                          channel.card_name, channel.channel_number)
     
     def on_frequency_changed(self, event=None):
         """Handle frequency selection change."""
@@ -624,9 +960,36 @@ class PXIeControlGUI:
                     widgets['status_label'].config(text="Ready", foreground='green')
                 else:
                     widgets['status_label'].config(text="Disabled", foreground='gray')
+                # Clear input displays
+                widgets['rms_label'].config(text="0.000 V")
+                widgets['peak_label'].config(text="0.000 V")
         
         except Exception as e:
             messagebox.showerror("Stop Error", f"Failed to stop generation:\n{e}")
+    
+    def update_input_displays(self):
+        """Periodically update input measurement displays."""
+        if self.is_generating:
+            # Update each enabled channel's input measurements
+            for key, widgets in self.channel_widgets.items():
+                if widgets['enabled_var'].get():
+                    # Parse card name and channel from key (e.g., "SV1_ch0")
+                    parts = key.split('_ch')
+                    if len(parts) == 2:
+                        card_name = parts[0]
+                        ch_num = int(parts[1])
+                        
+                        # Get measurements from generator
+                        measurements = self.generator.get_input_measurements(card_name, ch_num)
+                        rms = measurements.get('rms', 0.0)
+                        peak = measurements.get('peak', 0.0)
+                        
+                        # Update display labels
+                        widgets['rms_label'].config(text=f"{rms:.6f} V")
+                        widgets['peak_label'].config(text=f"{peak:.6f} V")
+        
+        # Schedule next update (100ms)
+        self.root.after(100, self.update_input_displays)
 
 
 def connect_to_chassis():
