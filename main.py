@@ -85,21 +85,28 @@ class FrequencyManager:
         """
         Calculate optimal sample rate for a given frequency.
         Ensures at least 100 samples per cycle, rounds to nice values.
+        PXIe-4468 maximum: 200 kS/s
         """
+        # Hardware limit for PXIe-4468
+        MAX_SAMPLE_RATE = 200000  # 200 kS/s
+        
         # Aim for at least 100 samples per cycle for good quality
         min_samples_per_cycle = 100
         base_rate = frequency * min_samples_per_cycle
         
+        # If requested rate exceeds hardware limit, use maximum
+        if base_rate > MAX_SAMPLE_RATE:
+            return MAX_SAMPLE_RATE
+        
         # Round to common sample rates
-        common_rates = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 
-                       200000, 500000, 1000000, 2000000]
+        common_rates = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 200000]
         
         for rate in common_rates:
             if rate >= base_rate:
                 return rate
         
-        # If frequency is very high, use maximum
-        return 2000000  # 2 MS/s max for PXIe-4468
+        # Fallback to maximum
+        return MAX_SAMPLE_RATE
 
 
 class MultiCardGenerator:
@@ -274,8 +281,11 @@ class MultiCardGenerator:
                     task = nidaqmx.Task()
                     print(f"  Task object created")
                     
-                    # Add all channels for this card
-                    for ch_num, amp_uv in channel_list:
+                    # Sort channels by channel number to ensure consistent ordering
+                    sorted_channels = sorted(channel_list, key=lambda x: x[0])
+                    
+                    # Add all channels for this card in sorted order
+                    for ch_num, amp_uv in sorted_channels:
                         channel_name = f"{card_name}/ao{ch_num}"
                         print(f"  Adding channel: {channel_name} ({amp_uv} µV)")
                         task.ao_channels.add_ao_voltage_chan(
@@ -299,16 +309,31 @@ class MultiCardGenerator:
                     task.out_stream.regen_mode = nidaqmx.constants.RegenerationMode.ALLOW_REGENERATION
                     
                     # Generate waveforms for each channel with individual amplitudes
+                    # Use the same sorted order as when adding channels
                     waveforms = []
-                    for ch_num, amp_uv in channel_list:
+                    for ch_num, amp_uv in sorted_channels:
                         amp_v = amp_uv / 1e6  # Convert microvolts to volts
                         waveform = self.generate_sinewave(freq, amp_v, srate)
                         waveforms.append(waveform)
-                        print(f"  Generated waveform for AO{ch_num}: {amp_v:.6f} V")
+                        # Debug: show waveform stats
+                        wf_min, wf_max = waveform.min(), waveform.max()
+                        wf_rms = np.sqrt(np.mean(waveform**2))
+                        print(f"  Generated waveform for AO{ch_num}: {amp_v:.6f} V ({amp_uv:.0f} µV)")
+                        print(f"    Waveform stats - Min: {wf_min:.6f}V, Max: {wf_max:.6f}V, RMS: {wf_rms:.6f}V, Samples: {len(waveform)}")
                     
-                    # Write interleaved data
-                    print(f"  Writing {len(waveforms)} waveforms...")
-                    task.write(waveforms, auto_start=False)
+                    # Write data
+                    # For multiple channels, nidaqmx expects a 2D array where each row is a channel
+                    # Convert list of waveforms to numpy array
+                    if len(waveforms) == 1:
+                        # Single channel - write 1D array
+                        write_data = waveforms[0]
+                        print(f"  Writing single channel waveform ({len(write_data)} samples)...")
+                    else:
+                        # Multiple channels - write 2D array (channels x samples)
+                        write_data = np.array(waveforms)
+                        print(f"  Writing {len(waveforms)} channel waveforms (shape: {write_data.shape})...")
+                    
+                    task.write(write_data, auto_start=False)
                     print(f"  Starting task...")
                     task.start()
                     
@@ -336,6 +361,7 @@ class MultiCardGenerator:
                             print(f"  Adding AI channel: {channel_name}")
                             ai_task.ai_channels.add_ai_voltage_chan(
                                 channel_name,
+                                terminal_config=nidaqmx.constants.TerminalConfiguration.PSEUDO_DIFF,
                                 min_val=-10.0,
                                 max_val=10.0
                             )
@@ -534,14 +560,14 @@ class OscilloscopeWindow:
         
         ttk.Label(controls, text="Y-Scale:").pack(side=tk.LEFT, padx=5)
         self.yscale_var = tk.StringVar(value="Auto")
-        yscale_combo = ttk.Combobox(controls, textvariable=self.yscale_var, width=10, 
-                                    values=["Auto", "±1V", "±2V", "±5V", "±10V"], state='readonly')
+        yscale_combo = ttk.Combobox(controls, textvariable=self.yscale_var, width=12, 
+                                    values=["Auto", "±100µV", "±500µV", "±1mV", "±10mV", "±100mV", "±1V", "±2V", "±5V", "±10V"], state='readonly')
         yscale_combo.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(controls, text="Time Span:").pack(side=tk.LEFT, padx=5)
         self.timespan_var = tk.StringVar(value="50ms")
         timespan_combo = ttk.Combobox(controls, textvariable=self.timespan_var, width=10,
-                                      values=["10ms", "25ms", "50ms", "100ms", "200ms"], state='readonly')
+                                      values=["100µs", "200µs", "500µs", "1ms", "2ms", "5ms", "10ms", "25ms", "50ms", "100ms"], state='readonly')
         timespan_combo.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(controls, text="Freeze", command=self.toggle_freeze).pack(side=tk.LEFT, padx=5)
@@ -570,9 +596,14 @@ class OscilloscopeWindow:
                 data = self.generator.get_scope_data(self.card_name, self.channel_number)
                 
                 if len(data) > 10:  # Ensure we have enough data
-                    # Parse time span
+                    # Parse time span (handle µs, ms)
                     timespan_str = self.timespan_var.get()
-                    timespan_ms = float(timespan_str.replace('ms', ''))
+                    if 'µs' in timespan_str:
+                        # Microseconds to milliseconds
+                        timespan_ms = float(timespan_str.replace('µs', '')) / 1000.0
+                    else:
+                        # Milliseconds
+                        timespan_ms = float(timespan_str.replace('ms', ''))
                     
                     # Calculate how many samples to show
                     sample_rate = self.generator.sample_rate
@@ -593,10 +624,17 @@ class OscilloscopeWindow:
                         # Update Y scale
                         yscale = self.yscale_var.get()
                         if yscale == "Auto":
-                            margin = max(np.max(np.abs(display_data)) * 0.1, 0.1)
+                            margin = max(np.max(np.abs(display_data)) * 0.1, 0.0001)
                             self.ax.set_ylim(np.min(display_data) - margin, np.max(display_data) + margin)
                         else:
-                            limit = float(yscale.replace('±', '').replace('V', ''))
+                            # Parse scale value (handle µV, mV, V)
+                            yscale_str = yscale.replace('±', '')
+                            if 'µV' in yscale_str:
+                                limit = float(yscale_str.replace('µV', '')) / 1e6
+                            elif 'mV' in yscale_str:
+                                limit = float(yscale_str.replace('mV', '')) / 1e3
+                            else:
+                                limit = float(yscale_str.replace('V', ''))
                             self.ax.set_ylim(-limit, limit)
                         
                         # Check for clipping (near ±10V)
