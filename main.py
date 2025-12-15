@@ -98,8 +98,8 @@ class FrequencyManager:
         if base_rate > MAX_SAMPLE_RATE:
             return MAX_SAMPLE_RATE
         
-        # Round to common sample rates
-        common_rates = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000]
+        # Round to common sample rates (must not exceed MAX_SAMPLE_RATE)
+        common_rates = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 200000]
         
         for rate in common_rates:
             if rate >= base_rate:
@@ -566,7 +566,7 @@ class OscilloscopeWindow:
         ttk.Label(controls, text="Y-Scale:").pack(side=tk.LEFT, padx=5)
         self.yscale_var = tk.StringVar(value="±100µV")
         yscale_combo = ttk.Combobox(controls, textvariable=self.yscale_var, width=12, 
-                                    values=["Auto", "±100µV", "±500µV", "±1mV", "±10mV", "±100mV", "±1V", "±2V", "±5V", "±10V"], state='readonly')
+                                    values=["Auto", "±100µV", "±200µV", "±300µV", "±500µV", "±1mV", "±10mV", "±100mV", "±1V", "±2V", "±5V", "±10V"], state='readonly')
         yscale_combo.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(controls, text="Time Span:").pack(side=tk.LEFT, padx=5)
