@@ -85,10 +85,10 @@ class FrequencyManager:
         """
         Calculate optimal sample rate for a given frequency.
         Ensures at least 100 samples per cycle, rounds to nice values.
-        PXIe-4468 maximum: 200 kS/s
+        PXIe-4468 AO maximum: 200 kS/s, AI maximum: 250 kS/s
         """
-        # Hardware limit for PXIe-4468
-        MAX_SAMPLE_RATE = 200000  # 200 kS/s
+        # Hardware limit for PXIe-4468 analog outputs
+        MAX_SAMPLE_RATE = 200000  # 200 kS/s for AO
         
         # Aim for at least 100 samples per cycle for good quality
         min_samples_per_cycle = 100
@@ -99,7 +99,7 @@ class FrequencyManager:
             return MAX_SAMPLE_RATE
         
         # Round to common sample rates
-        common_rates = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 200000]
+        common_rates = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000]
         
         for rate in common_rates:
             if rate >= base_rate:
@@ -114,6 +114,8 @@ class MultiCardGenerator:
     
     CHANNELS_PER_CARD = 2  # PXIe-4468 has 2 analog outputs: ao0, ao1
     CARD_NAMES = ["SV1", "SV2", "SV3", "SV4"]
+    MAX_AO_SAMPLE_RATE = 200000  # AO (output) limit: 200 kS/s
+    MAX_AI_SAMPLE_RATE = 250000  # AI (input) limit: 250 kS/s
     
     def __init__(self):
         self.ao_tasks: Dict[str, nidaqmx.Task] = {}  # Analog output tasks
@@ -124,7 +126,8 @@ class MultiCardGenerator:
         
         # Current configuration
         self.frequency = 1000.0  # Hz
-        self.sample_rate = 100000  # Hz
+        self.sample_rate = 100000  # Hz (for AO output)
+        self.ai_sample_rate = self.MAX_AI_SAMPLE_RATE  # Always use max for AI (oscilloscope: 250kS/s)
         self.channels: List[ChannelConfig] = []
         
         # Input data storage (RMS and peak per channel)
@@ -256,7 +259,8 @@ class MultiCardGenerator:
             # Initial task creation
             with self.lock:
                 freq = self.frequency
-                srate = self.sample_rate
+                srate = self.sample_rate  # AO sample rate
+                ai_srate = self.ai_sample_rate  # AI sample rate (always max)
                 # Create copy of enabled channels
                 enabled_chs = [(ch.card_name, ch.channel_number, ch.amplitude_uv) 
                               for ch in self.channels if ch.enabled]
@@ -367,10 +371,11 @@ class MultiCardGenerator:
                             )
                         
                         # Configure timing for continuous acquisition with large buffer
+                        # Use maximum sample rate for AI to get best oscilloscope display resolution
                         # Buffer size should be at least 2 seconds of data
-                        buffer_size = int(srate * 2)  # 2 seconds of buffer
+                        buffer_size = int(ai_srate * 2)  # 2 seconds of buffer
                         ai_task.timing.cfg_samp_clk_timing(
-                            rate=srate,
+                            rate=ai_srate,
                             sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
                             samps_per_chan=buffer_size
                         )
@@ -521,13 +526,13 @@ class OscilloscopeWindow:
         self.channel_number = channel_number
         self.window = tk.Toplevel(parent)
         self.window.title(f"Oscilloscope - {card_name}/AI{channel_number}")
-        self.window.geometry("900x600")
+        self.window.geometry("550x400")
         
         self.is_running = True
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         
         # Create matplotlib figure
-        self.fig = Figure(figsize=(9, 5), dpi=100)
+        self.fig = Figure(figsize=(5.5, 3.5), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel('Time (ms)')
         self.ax.set_ylabel('Voltage (V)')
@@ -559,7 +564,7 @@ class OscilloscopeWindow:
         controls.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
         
         ttk.Label(controls, text="Y-Scale:").pack(side=tk.LEFT, padx=5)
-        self.yscale_var = tk.StringVar(value="Auto")
+        self.yscale_var = tk.StringVar(value="±100µV")
         yscale_combo = ttk.Combobox(controls, textvariable=self.yscale_var, width=12, 
                                     values=["Auto", "±100µV", "±500µV", "±1mV", "±10mV", "±100mV", "±1V", "±2V", "±5V", "±10V"], state='readonly')
         yscale_combo.pack(side=tk.LEFT, padx=5)
@@ -605,17 +610,16 @@ class OscilloscopeWindow:
                         # Milliseconds
                         timespan_ms = float(timespan_str.replace('ms', ''))
                     
-                    # Calculate how many samples to show
-                    sample_rate = self.generator.sample_rate
-                    samples_to_show = int((timespan_ms / 1000.0) * sample_rate)
+                    # Calculate how many samples to show using AI sample rate (200kS/s)
+                    samples_to_show = int((timespan_ms / 1000.0) * self.generator.ai_sample_rate)
                     samples_to_show = min(samples_to_show, len(data))
                     
                     if samples_to_show > 0:
                         # Get last N samples
                         display_data = data[-samples_to_show:]
                         
-                        # Create time axis in milliseconds
-                        time_ms = np.arange(len(display_data)) / sample_rate * 1000
+                        # Create time axis in milliseconds using AI sample rate
+                        time_ms = np.arange(len(display_data)) / self.generator.ai_sample_rate * 1000
                         
                         # Update plot
                         self.line.set_data(time_ms, display_data)
@@ -646,11 +650,15 @@ class OscilloscopeWindow:
                         else:
                             self.clip_text.set_text('')
                         
-                        # Update stats
+                        # Update stats with samples per cycle info
                         rms = np.sqrt(np.mean(display_data**2))
                         peak = np.max(np.abs(display_data))
                         freq_est = self.generator.frequency
-                        stats = f'RMS: {rms:.4f} V\nPeak: {peak:.4f} V\nFreq: {freq_est:.1f} Hz'
+                        samples_per_cycle = self.generator.ai_sample_rate / freq_est
+                        # Display in µV for better readability with high-gain amplifiers
+                        rms_uv = rms * 1e6
+                        peak_uv = peak * 1e6
+                        stats = f'RMS: {rms_uv:.1f} µV\nPeak: {peak_uv:.1f} µV\nFreq: {freq_est:.1f} Hz\nSamples/Cycle: {samples_per_cycle:.1f}'
                         self.stats_text.set_text(stats)
                         
                         # Use draw_idle() instead of draw() - non-blocking
